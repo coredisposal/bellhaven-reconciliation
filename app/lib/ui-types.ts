@@ -55,6 +55,13 @@ export interface ReviewOption {
   operations: Operation[];
 }
 export interface Proposal {
+  quality?: {
+    category: string;
+    title: string;
+    detail: string;
+    guidance: string;
+    contacts: import('./domain-types').Contact[];
+  };
   id: string;
   version: string;
   key: string;

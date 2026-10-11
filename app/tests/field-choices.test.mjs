@@ -213,6 +213,13 @@ test('field choices: a legacy interrupted CHOW resumes its stored original field
   assert.deepEqual(original, { ...before, chow_current_account: 'created-account' });
   assert.equal(s.writes.filter((write) => write.create).length, 1);
   for (let i = 0; i < 2; i++) assert.equal((await runPipeline(s.ledger, s.snapshot)).new_proposals, 0);
+  const state = await reviewState(s.ledger, 'live');
+  assert.equal(state.proposals.find((proposal) => proposal.id === p.id).status, 'applied');
+  assert.equal(state.proposals.filter((proposal) => proposal.key === p.key && proposal.status === 'pending').length, 0);
+  const currentFacility = state.proposals.find((proposal) => proposal.key === p.key && proposal.current);
+  assert(currentFacility);
+  assert(['unchanged', 'applied'].includes(currentFacility.status), 'Legacy approval remains in history while its verified current facility stays closed');
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM decisions WHERE proposal_id=? AND action='approve'").get(p.id).n, 1);
 });
 
 test('field choices: interrupted CHOW remembers selected care and phone only on the replacement', async (t) => {
@@ -238,6 +245,7 @@ test('field choices: interrupted CHOW remembers selected care and phone only on 
   assert.deepEqual(s.writes[1].fields, { chow_current_account: replacement.account_id });
   assert.equal(s.writes.filter((write) => write.create).length, 1);
   await assertClosed(s, p);
+  assert.equal((await reviewState(s.ledger, 'live')).proposals.filter((proposal) => proposal.current && proposal.status === 'pending').length, 0);
 });
 
 test('field choices: duplicate-only survivor gains its selected patch before retirement, without editing loser identity', async (t) => {

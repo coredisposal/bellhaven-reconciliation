@@ -11,13 +11,16 @@ export function reviewRows(data, { view, filter, search }) {
     view === 'history'
       ? ['applied', 'rejected'].includes(p.status)
       : view === 'facilities'
-        ? p.facility && (p.current === true ||
+        ? p.kind !== 'crm_quality' && p.facility && (p.current === true ||
           (p.current === undefined && all.findIndex((row) => row.key === p.key) === index))
         : OPEN_PROPOSAL_STATUSES.includes(p.status)
   );
   return rows.filter((p) =>
     (filter === 'all' || p.kind === filter) &&
-    `${p.title} ${p.city} ${p.state}`.toLowerCase().includes(search.toLowerCase())
+    `${p.title} ${p.city} ${p.state} ${p.quality ? [
+      ...p.candidates.map((c) => `${c.account.name} ${c.account.account_id}`),
+      ...p.quality.contacts.map((c) => `${c.name} ${c.email ?? ''} ${c.contact_id}`),
+    ].join(' ') : ''}`.toLowerCase().includes(search.toLowerCase())
   );
 }
 
@@ -65,7 +68,7 @@ export function adoptPendingRefresh(current, incoming, position, input) {
   return {
     ...position,
     ...(inView ? {} : {
-      view: replacement.facility
+      view: replacement.facility && replacement.kind !== 'crm_quality'
         ? 'facilities'
         : ['applied', 'rejected'].includes(replacement.status) ? 'history' : 'queue',
       filter: 'all',

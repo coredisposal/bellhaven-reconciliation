@@ -1,7 +1,7 @@
 /** Domain contracts shared by matching, execution, and review presentation. */
 export type BillingValue = number | string | null;
 export type CareCategory = 'Skilled Nursing' | 'Assisted Living' | 'Memory Care' | 'Independent Living';
-export type ProposalKind = 'unchanged' | 'field_correction' | 'parent_correction' | 'chow' | 'new_account' | 'duplicate' | 'ambiguous' | 'absent' | 'manual';
+export type ProposalKind = 'unchanged' | 'field_correction' | 'parent_correction' | 'chow' | 'new_account' | 'duplicate' | 'ambiguous' | 'absent' | 'manual' | 'crm_quality';
 export type ProposalStatus = 'pending' | 'partial' | 'applying' | 'stale' | 'unchanged' | 'superseded' | 'applied' | 'rejected';
 export type DecisionAction = 'approve' | 'reject' | 'resume' | 'reopen';
 
@@ -156,6 +156,13 @@ export interface MatchingConflict {
   facilities?: Facility[];
 }
 export interface ProposalDraft {
+  quality?: {
+    category: 'account_overlap' | 'duplicate' | 'relationship' | 'billing' | 'shared_email' | 'retired_contact' | 'orphan_contact' | 'website_fields';
+    title: string;
+    detail: string;
+    guidance: string;
+    contacts: Contact[];
+  };
   key: string;
   title: string;
   city?: string | null;

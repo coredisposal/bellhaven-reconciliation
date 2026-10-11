@@ -1,6 +1,6 @@
 # Bellhaven Review Desk
 
-Facility reconciliation with evidence review and approval-based CRM updates. The pipeline reads the operator website and CRM, proposes corrections, and writes only after a reviewer approves the stored proposal.
+Facility reconciliation and CRM quality checks with evidence review and approval-based updates. The pipeline reads the operator website and the complete CRM, proposes corrections or follow-ups, and writes only after a reviewer approves the stored proposal.
 
 Open the public [Bellhaven Review Desk](https://bellhaven-review-desk.swiftsandisp-8895.chatgpt.site) without signing in, or [run it locally](#run-locally) with server credentials supplied by the owner. Review actions affect the exercise CRM.
 
@@ -15,7 +15,7 @@ The first three requirements are built into the app. The daily schedule is a sep
 | **3. Review app and approved API updates** | Select a case in **Review → Proposed changes**, inspect the evidence and billing panel, then choose **Approve and apply** or enter a reason and **Reject proposal**. Approved writes are read back through the CRM API. Inspect saved outcomes in **Activity → Decisions**; inspect the resulting record in **CRM records**. Refreshing, matching, and rejection never write to the CRM. | [Review UI](app/app/page.tsx); [server API](app/lib/server.ts); [application and CHOW safeguards](app/lib/engine.mjs) |
 | **4. Daily schedule and safe reruns** | Open [`.github/workflows/daily-reconciliation.yml`](.github/workflows/daily-reconciliation.yml). It includes a manual run and a commented daily cron. Configure the variables/secrets under **Hosting and scheduling** below before running it. In the app, **Refresh sources** runs the same pipeline; **Activity → Source refreshes** shows each result. Unchanged approved/rejected evidence is not re-proposed; material changes require fresh review. | [Workflow](.github/workflows/daily-reconciliation.yml); [durable ledger](app/lib/ledger.mjs); [rerun and recovery tests](app/tests/e2e/proxy-backend.test.mjs) |
 
-To inspect the work without changing CRM data: browse **Website locations**, open a **Review match**, and inspect **Activity**. Approval is a real write to the exercise CRM, so use it only for a change you intend to apply. Automated tests exercise approval and recovery against an isolated CRM service.
+To inspect the work without changing CRM data: browse **Website locations**, open a **Review match**, and inspect **Activity**. **Approve and apply** writes the displayed changes to the exercise CRM; **Save review** or **Save choice** records a decision without changing CRM fields. Automated tests exercise approval and recovery against an isolated CRM service.
 
 ## Run locally
 
@@ -45,7 +45,7 @@ node scripts/local.mjs migrate
 node scripts/local.mjs dev
 ```
 
-Open `http://127.0.0.1:5173`. Select **Refresh sources**, inspect a case, and approve or reject it. Refreshing and matching do not write to the CRM. Approvals affect the actual exercise CRM. Keep the local server on loopback.
+Open `http://127.0.0.1:5173`. Select **Refresh sources**, inspect a case, and approve or reject it. Refreshing and matching do not write to the CRM. **Approve and apply** affects the actual exercise CRM; no-write review choices are labeled explicitly. Keep the local server on loopback.
 
 The helper tracks local migrations under `.sites-runtime/`; preserve it with `.wrangler/state`. On Windows ARM, `python scripts/bootstrap_node.py` from the repository root installs a checksum-verified local x64 runtime; `node scripts/local.mjs install` from `app/` then installs dependencies through that runtime.
 
@@ -83,6 +83,27 @@ Duplicate proposals show **Accounts in this review** beside the resolution: ever
 
 For **Needs judgment** cases, **Choose a resolution** shows each available outcome directly. Amberly offers creating the Ohio facility separately or correcting the existing Juniper account after confirming its identity. Kettering offers a survivor with duplicate cleanup, or updating one account while retaining the other copies. Duplicate cases also offer that limited update. Each choice previews its exact CRM changes and billing treatment; add a reviewer note, then **Approve and apply**. **Leave CRM unchanged → Reject proposal** saves a no-change decision. Clear matches retain a straightforward approval path, and unchanged accounts need no approval. Missing billing data and broken history links cannot be bypassed by choosing a different route.
 
+## CRM-wide quality checks
+
+**Refresh sources** also checks every account and contact, including records outside Bellhaven. Open **Review → Proposed changes** and select **Change → CRM quality** to see these findings in the same queue. Search by account or contact details. Each case shows the affected IDs, current parent and status, revenue and AR, relevant contacts, and the exact changes in each available choice.
+
+| Finding | Available review outcome |
+| --- | --- |
+| Accounts sharing a physical address | Keep the records separate, or set eligible accounts to `Needs Review` with a factual note. A shared address does not prove duplication or ownership transfer. |
+| Strongly corroborated duplicate accounts | Offer consolidation only when active records have matching normalized names, addresses, ZIPs, phones, care categories and a valid common parent. Retired copies must have zero revenue, zero AR and no contacts, and cannot be targets of existing history links. Approval marks those copies `Inactive` and links them to the named survivor. |
+| Broken account relationships | Show missing targets, parent/history cycles, conflicting CHOW and duplicate links, or history ending at an inactive account. Record the review; repair the relationship separately after confirming the intended record. |
+| Invalid billing values | Flag missing or invalid revenue/AR, or negative lifetime revenue. Record the review and have billing confirm the values. A negative AR credit balance alone is preserved, not treated as an error. |
+| Contact follow-ups | Show different names sharing an email, contacts on retired/historical accounts, or contacts pointing to missing accounts. Record the review without editing or moving contacts. Confirm the details before staging a separate contact proposal in **CRM records**. |
+| Optional website fields on a matched facility | Keep current values or choose the offered website phone and supported care category. These choices preserve the account's parent, address and billing values. Previously approved choices to retain unchanged values are respected. |
+
+Select a resolution and enter a reviewer note. **Save review** records an acknowledgment with no CRM API writes. **Approve and apply** writes only the selected, server-stored changes after rechecking the evidence. **Reject proposal** saves the reason without a CRM write. Choices are not preselected, and contacts are never migrated as part of account cleanup.
+
+Saved acknowledgments, approvals and rejections persist across restarts and repeat runs. Unchanged decided findings stay closed; material changes to the relevant evidence require fresh review. In **Activity → Decisions**, a no-write acknowledgment appears as **Reviewed**. Rejected or stale cases can be reopened with a reason while retaining the earlier history. A saved review closes that suggestion; it does not establish that an unresolved ownership or contact fact has been corrected.
+
+**Activity → Operations report** includes CRM-quality cases separately from the website facility count. Case totals can therefore exceed the number of website locations. Verified history includes completed CRM updates and verified no-write decisions; it is an operational record, not an accuracy score. A zero review queue alone does not prove every source fact is correct.
+
+Implementation: [combined pipeline](app/lib/reconciliation.mjs), [CRM quality rules](app/lib/crm-quality.mjs), [quality review UI](app/app/quality-case.tsx), and [SQL-backed report](app/lib/reporting.mjs).
+
 ## Verification
 
 The verification scripts also need Python 3.10 or newer. No live CRM credentials are needed for tests.
@@ -103,7 +124,7 @@ From the repository root:
 python scripts/secret_scan.py
 ```
 
-Tests cover source pagination, matching edge cases, billing preservation, stale evidence, competing approvals, interrupted operations, repeat runs, API validation, and credential redaction. The E2E suite runs compiled production Workers with local D1 and an isolated upstream service. It also exercises a local proxy Worker connected to a hosted-mode Worker. Test writes never reach the exercise CRM. The verification workflow repeats the checks on Linux x64 without live credentials.
+Tests cover source pagination, matching edge cases, billing preservation, CRM-wide quality findings, conservative consolidation, no-write acknowledgments, stale evidence, competing approvals, interrupted operations, repeat runs, API validation, and credential redaction. The E2E suite runs compiled production Workers with local D1 and an isolated upstream service. It also exercises a local proxy Worker connected to a hosted-mode Worker. Test writes never reach the exercise CRM. The verification workflow repeats the checks on Linux x64 without live credentials.
 
 Shared domain contracts cover CRM records, source evidence, proposal options, and operation checkpoints. The matching, API client, approval, manual-edit, and ledger modules use strict TypeScript checking through JSDoc. Runtime checks also validate external CRM responses, request bodies, and persisted operations before they are used; missing billing data is never treated as zero.
 
@@ -111,11 +132,11 @@ Shared domain contracts cover CRM records, source evidence, proposal options, an
 
 The app uses Vinext, React, TypeScript, and Cloudflare D1. `app/.openai/hosting.json` declares the Site identity and D1 binding; `app/drizzle/` holds schema migrations. Preserve the Sites build integration when deploying. On the hosted service set `APP_MODE=live` and configure server-only secrets `CRM_TOKEN`, `PROXY_KEY`, and `CRON_SECRET`. Never place secrets in frontend variables, Git, logs, or URLs.
 
-[The daily workflow](.github/workflows/daily-reconciliation.yml) includes manual dispatch and a commented, inactive schedule at 07:00 UTC. It calls the hosted proposal pipeline and never approves changes. Set repository variable `BELLHAVEN_SITE_URL` and secret `BELLHAVEN_CRON_SECRET` (the hosted `CRON_SECRET`). This public Site needs no Sites authentication token. The optional `BELLHAVEN_SITES_SERVICE_TOKEN` is only for hosting that is later made private. Scheduling remains inactive until explicitly enabled.
+[The daily workflow](.github/workflows/daily-reconciliation.yml) includes manual dispatch and a commented, inactive schedule at 07:00 UTC. It calls the same hosted pipeline for facility reconciliation and CRM-wide quality checks, and never approves changes. Set repository variable `BELLHAVEN_SITE_URL` and secret `BELLHAVEN_CRON_SECRET` (the hosted `CRON_SECRET`). This public Site needs no Sites authentication token. The optional `BELLHAVEN_SITES_SERVICE_TOKEN` is only for hosting that is later made private. Scheduling remains inactive until explicitly enabled.
 
 To demonstrate it, open **GitHub → Actions → Daily Bellhaven reconciliation → Run workflow** and choose `main`. After the run succeeds, open **Activity → Source refreshes** in the app. The workflow saves results directly to the hosted ledger; no code push or site redeployment is needed. The local app reads the same results. Run it again to verify that unchanged decided cases stay closed. To enable daily runs later, uncomment the workflow's `schedule` and `cron` lines.
 
-Each GitHub run summary separates **New proposals this run** from **Open proposals after refresh** and links to the review desk. New means newly added actionable evidence, including new locations or material website/CRM changes. Open is the total queue at completion, including existing proposals, manual drafts, stale cases, and interrupted work; applied, rejected, unchanged, and superseded cases are excluded. A repeat run can correctly show **0 new** and **35 open**. The same saved count appears in **Activity → Source refreshes**; older runs without this metric omit it. Later decisions change the current queue, not a past run's snapshot.
+Each GitHub run summary separates **New proposals this run** from **Open proposals after refresh** and links to the review desk. New means newly added reviewable evidence, including new locations, CRM-quality findings or material website/CRM changes. Open is the total queue at completion, including existing proposals, manual drafts, stale cases, and interrupted work; applied, rejected, unchanged, and superseded cases are excluded. A repeat run can correctly show **0 new** and **35 open**. The same saved count appears in **Activity → Source refreshes**; older runs without this metric omit it. Later decisions change the current queue, not a past run's snapshot.
 
 Results appear automatically within about 30 seconds while the app is open, or when you return to its tab. If the case you are reviewing changed, choose **Load latest** before deciding; your review note is preserved.
 

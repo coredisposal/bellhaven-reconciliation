@@ -8,6 +8,7 @@ import Operations from './operations';
 import Locations from './locations';
 import MatchContext from './match-context';
 import AccountImpact from './account-impact';
+import QualityCase from './quality-case';
 import Crm, { ManualCase } from './crm';
 import {
   selectedOption,
@@ -60,6 +61,7 @@ const labels: Record<string, string> = {
   unchanged: 'Unchanged',
   manual_account: 'Account edit',
   manual_contact: 'Contact edit',
+  crm_quality: 'CRM quality',
 };
 const money = formatBalance;
 const date = (v: string) =>
@@ -282,7 +284,7 @@ export default function Desk() {
           ? `Snapshot complete. ${result.new_proposals} new proposals.${result.open_proposals === undefined ? '' : ` ${result.open_proposals} open after refresh.`}`
           : result.status === 'applied'
             ? chosen?.field_choices && !chosen.operations.length
-              ? 'Your choice to keep current values is saved. No CRM fields changed.'
+              ? p?.kind === 'crm_quality' ? 'Review saved. No CRM fields changed.' : 'Your choice to keep current values is saved. No CRM fields changed.'
               : 'Approved changes were read back and verified.'
             : result.status === 'rejected'
               ? 'Proposal rejected. Your decision is saved.'
@@ -310,7 +312,7 @@ export default function Desk() {
         'decision',
         { id: p.id, version: p.version, action, optionId: effectiveOption, note },
         action === 'approve'
-          ? 'Verifying and applying…'
+          ? p.kind === 'crm_quality' && chosen?.field_choices && !chosen.operations.length ? 'Verifying and saving review…' : 'Verifying and applying…'
           : action === 'resume'
             ? 'Reconciling operation…'
             : 'Saving decision…'
@@ -605,8 +607,8 @@ export default function Desk() {
                   <input
                     value={search}
                     onChange={(e) => setSearch(e.target.value)}
-                    placeholder="Search facilities or cities"
-                    aria-label="Search facilities or cities"
+                    placeholder="Search accounts or contacts"
+                    aria-label="Search accounts or contacts"
                   />
                 </label>
                 {['queue', 'facilities'].includes(view) && (
@@ -653,13 +655,13 @@ export default function Desk() {
                     >
                       <span className="case-title">{item.title}</span>
                       <span className="case-locality">
-                        {item.city}, {item.state}
+                        {[item.city, item.state].filter(Boolean).join(', ') || (item.kind === 'crm_quality' ? 'CRM-wide check' : 'CRM record')}
                         <ArrowRight size={14} />
                       </span>
                       <span className="case-bottom">
                         <span className={'classification ' + item.kind}>{labels[item.kind]}</span>
                         {['applied', 'rejected', 'partial', 'stale'].includes(item.status) && (
-                          <span className="small-status">{item.status}</span>
+                          <span className="small-status">{item.kind === 'crm_quality' && item.status === 'applied' && item.options.find((option) => option.id === selectedOption(item, data.decisions))?.operations.length === 0 ? 'Reviewed' : item.status}</span>
                         )}
                       </span>
                     </button>
@@ -688,7 +690,19 @@ export default function Desk() {
                 )}
               </div>
             </aside>
-            {p?.manual ? (
+            {p?.kind === 'crm_quality' ? (
+              <QualityCase
+                proposal={p}
+                decisions={data.decisions}
+                optionId={effectiveOption}
+                setOption={setOption}
+                note={note}
+                setNote={setNote}
+                busy={decisionBusy}
+                mutationBusy={!!busy}
+                onDecision={decision}
+              />
+            ) : p?.manual ? (
               <ManualCase
                 proposal={p}
                 decisions={data.decisions}
@@ -1241,6 +1255,13 @@ function Method({ data }: { data: DeskState }) {
         ID; an uncertain response without an ID requires recovery and is never blindly retried.
       </p>
       <h3>Evidence boundaries</h3>
+      <p>
+        CRM quality checks inspect all accounts and contacts for overlapping records, broken account
+        links, invalid billing values, shared contact emails, and contacts on retired or missing
+        accounts. They also catch optional website field differences on already matched facilities.
+        Each finding presents its evidence and explicit choices. Recording a review can leave CRM
+        data unchanged; a saved acknowledgment does not prove an unresolved fact has been corrected.
+      </p>
       <p>
         The website supports operator affiliation in this fictional exercise; it does not establish
         legal ownership or acquisition dates. Contacts inform automated matching. Any separate

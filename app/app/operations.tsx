@@ -13,6 +13,7 @@ const kinds: Record<string, string> = {
   chow: 'CHOW required',
   new_account: 'New account',
   absent: 'Website absence',
+  crm_quality: 'CRM quality',
 };
 const stamp = (s: string | null | undefined) =>
   s ? new Date(s).toLocaleString() : 'No completed snapshot';
@@ -102,7 +103,7 @@ export default function Operations({ onReview }: { onReview: () => void }) {
           <dd>{recovery.case_count}</dd>
         </div>
         <div>
-          <dt>Verified applied, ever</dt>
+          <dt>Verified decisions, ever</dt>
           <dd>{history.verified_applied_cases}</dd>
         </div>
         <div>
@@ -114,8 +115,8 @@ export default function Operations({ onReview }: { onReview: () => void }) {
         <section>
           <h3>Current reconciliation cases</h3>
           <p>
-            {current.total} cases from {source.counts.facilities} website facilities, including any
-            absent-account cases. A rejected change remains unresolved.
+            {current.total} cases across {source.counts.facilities} website facilities and CRM-wide
+            quality checks. A rejected change remains unresolved.
           </p>
           <table>
             <caption>Classification in the last complete source snapshot</caption>
@@ -170,8 +171,8 @@ export default function Operations({ onReview }: { onReview: () => void }) {
           </dl>
           <p className="evidence-foot">
             Current counts use one case per latest complete snapshot. Verified history counts
-            distinct cases with approval, completed checkpoints, and readback audit evidence. Reruns
-            do not inflate these totals.
+            distinct approved cases with completed checkpoints and readback evidence, or a verified
+            no-write decision. Reruns do not inflate these totals.
           </p>
         </section>
       </div>
@@ -195,7 +196,8 @@ export default function Operations({ onReview }: { onReview: () => void }) {
       <details className="ops-definitions">
         <summary>Metric definitions and report data</summary>
         <p>
-          These are operational controls, not an accuracy score or a revenue-impact estimate. Source
+          Saved reviews can leave CRM fields unchanged and do not prove an unresolved fact has been
+          corrected. These are operational controls, not an accuracy score or a revenue-impact estimate. Source
           freshness uses a 26-hour threshold for the documented daily schedule. Counts retain the
           last complete evidence when a later run fails.
         </p>

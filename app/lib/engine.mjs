@@ -11,7 +11,6 @@
 /** @typedef {import('./execution-types').ReviewerIdentity} ReviewerIdentity */
 /** @typedef {import('./execution-types').SqlStatement} SqlStatement */
 import {
-  reconcile,
   canonical,
   businessAccount,
   facilityMaterial,
@@ -20,6 +19,7 @@ import {
   OPEN_PROPOSAL_STATUSES,
   evidenceMatches,
 } from './core.mjs';
+import { reconcile } from './reconciliation.mjs';
 import { assertNoInterruptedOverlap } from './recovery-conflicts.mjs';
 import { isRecord, isAccount, isFacility } from './contracts.mjs';
 const now = () => new Date().toISOString();
@@ -45,7 +45,7 @@ export async function runPipeline(ledger, getSnapshot) {
       '{}'
     );
     const snapshot = await getSnapshot();
-    const proposals = await reconcile(snapshot);
+    const proposals = await reconcile(snapshot, ledger.db);
     // Publish the replacement queue, completed run, and audit as one D1 transaction.
     // A failed publication must leave the last successful queue intact.
     /** @type {import('./execution-types').PriorProposalRow[]} */
@@ -272,11 +272,11 @@ export async function decide(ledger, client, getSnapshot, input, identity) {
       option = p.options.find((o) => o.id === optionId);
       if (!option || (!option.operations.length && !option.field_choices))
         throw new Error('Select an available server-stored operation.');
-      if ((p.kind === 'ambiguous' || option.resolution) && !note?.trim())
+      if ((p.kind === 'ambiguous' || p.kind === 'crm_quality' || option.resolution) && !note?.trim())
         throw new Error('Explain your resolution choice before approval.');
       await assertNoInterruptedOverlap(ledger, p, option);
       const snapshot = await getSnapshot();
-      const fresh = (await reconcile(snapshot)).find((x) => x.key === p.key);
+      const fresh = (await reconcile(snapshot, ledger.db)).find((x) => x.key === p.key);
       if (!evidenceMatches(fresh, p.evidence_version ?? p.version) ||
           !fresh || !(await sameApprovedOption(p, option, fresh))) {
         await ledger.run("UPDATE proposals SET status='stale' WHERE id=?", id);
@@ -476,20 +476,20 @@ export async function decide(ledger, client, getSnapshot, input, identity) {
       const verifiedSnapshot = await getSnapshot();
       await validateResume(ledger, p, option, verifiedSnapshot);
       if (option.resolution === 'separate' || option.resolution === 'existing' || option.field_choices) {
-        const resolved = (await reconcile(verifiedSnapshot)).find((row) => row.key === p.key);
-        if (!resolved) throw new Error('Resolved location is missing from verified evidence.');
+        const resolved = (await reconcile(verifiedSnapshot, ledger.db)).find((row) => row.key === p.key);
+        if (!resolved && p.kind !== 'crm_quality') throw new Error('Resolved location is missing from verified evidence.');
         await ledger.fence(lock);
         await ledger.batch([
           [
             "UPDATE proposals SET status='applied',data=? WHERE id=?",
-            JSON.stringify({ ...p, resolution_evidence_version: resolved.version }),
+            JSON.stringify({ ...p, ...(resolved ? { resolution_evidence_version: resolved.version } : {}) }),
             id,
           ],
           ledger.auditStatement(option.resolution ? 'identity_resolution_verified' : 'field_selection_verified', {
             option: option.id,
             resolution: option.resolution,
             ...(option.field_choices ? { field_choices: option.field_choices } : {}),
-            evidence_version: resolved.version,
+            evidence_version: resolved?.version ?? null,
           }, id),
         ]);
       } else await ledger.run("UPDATE proposals SET status='applied' WHERE id=?", id);
@@ -648,7 +648,7 @@ async function validateResume(ledger, p, option, snapshot) {
       );
     }
   }
-  const original = (await reconcile(beforeSnapshot)).find((row) => row.key === p.key);
+  const original = (await reconcile(beforeSnapshot, ledger.db)).find((row) => row.key === p.key);
   if (!evidenceMatches(original, p.evidence_version ?? p.version) ||
       !original || !(await sameApprovedOption(p, option, original)))
     throw new Error(

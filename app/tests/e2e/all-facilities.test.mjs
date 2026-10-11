@@ -123,9 +123,17 @@ test('complete review: all 35 website locations and three absent records work th
   assert.equal(website.flatMap((f) => f.care_offerings).length, 37);
   assert(website.some((f) => f.name === 'Bellhaven Meadows of Findlay'));
   assert.equal(hosted.writes.length, 0, 'Discovery and classification are read-only');
-  const initialCases = state.proposals.filter((p) => p.current);
+  const currentCases = state.proposals.filter((p) => p.current);
+  const initialQuality = currentCases.filter((p) => p.kind === 'crm_quality');
+  const initialCases = currentCases.filter((p) => p.kind !== 'crm_quality');
+  assert.equal(currentCases.length, 42);
   assert.equal(initialCases.length, 38);
   assert.equal(initialCases.filter((p) => p.kind === 'absent').length, 3);
+  assert.deepEqual(initialQuality.map((p) => p.quality.category).sort(),
+    ['account_overlap', 'retired_contact', 'retired_contact', 'shared_email']);
+  assert(initialQuality.every((p) => p.key.startsWith('quality:') && p.facility === null));
+  assert.equal(new Set(currentCases.map((p) => p.key)).size, currentCases.length,
+    'CRM-wide follow-ups use distinct cases instead of replacing facility reviews');
   const approved = [];
   const unchanged = [];
   // Refresh between reviews just as a reviewer can do after another decision:
@@ -195,6 +203,61 @@ test('complete review: all 35 website locations and three absent records work th
     else for (const offering of f.care_offerings)
       assert(account.note.includes(offering), `${f.name}: all care offerings survive reconciliation`);
   }
+  // The broader CRM audit discovers follow-ups separate from account correction.
+  // Independently identify the current evidence, then record a no-write review:
+  // a shared inbox or contact on retired history is not authority to move it.
+  ok(await post(local, 'pipeline', {}));
+  state = await get(local, 'state');
+  const qualityCases = state.proposals.filter((p) => p.current && p.kind === 'crm_quality');
+  const accountMap = byId(hosted.data.accounts);
+  const retiredWithContacts = hosted.data.accounts.filter((a) =>
+    (a.status === 'Inactive' || a.chow_current_account || a.duplicate_of_account) &&
+    hosted.data.contacts.some((c) => c.account_id === a.account_id && c.is_active !== false));
+  const expectedQualityKeys = [
+    ...retiredWithContacts.map((a) => `quality:retired-contacts:${a.account_id}`),
+    initialQuality.find((p) => p.quality.category === 'account_overlap').key,
+    initialQuality.find((p) => p.quality.category === 'shared_email').key,
+  ].sort();
+  assert.deepEqual(qualityCases.map((p) => p.key).sort(), expectedQualityKeys,
+    'Only independently identified contact and Sandusky ownership follow-ups remain');
+  const writesBeforeFollowups = hosted.writes.length;
+  const accountsBeforeFollowups = structuredClone(hosted.data.accounts);
+  for (const p of qualityCases) {
+    assert.equal(p.status, 'pending', p.title);
+    assert.equal(p.facility, null, 'No previously decided website-field choice is re-proposed');
+    if (p.quality.category === 'retired_contact') {
+      const old = accountMap.get(p.candidates[0].account.account_id);
+      assert(old.status === 'Inactive' || old.chow_current_account || old.duplicate_of_account);
+      assert(p.quality.contacts.some((c) => c.account_id === old.account_id && c.is_active !== false));
+      assert(p.options.every((o) => o.operations.length === 0), 'Contact follow-up cannot migrate contacts');
+    } else if (p.quality.category === 'shared_email') {
+      const people = p.quality.contacts.filter((c) => c.email?.toLowerCase() === 'dnovak@bellhavenliving.com');
+      assert.equal(people.length, 2);
+      assert.equal(new Set(people.map((c) => c.name)).size, 2);
+      assert(p.options.every((o) => o.operations.length === 0), 'A shared inbox does not identify a correction');
+    } else {
+      assert.equal(p.quality.category, 'account_overlap');
+      assert.deepEqual(p.candidates.map((c) => c.account.name).sort(),
+        ['Bellhaven of Sandusky', 'Millstone Care of Sandusky']);
+      assert.equal(new Set(p.candidates.map((c) => c.account.parent_id)).size, 2);
+      assert(!p.options.some((o) => o.operations.some((op) => ['chow', 'create', 'duplicate'].includes(op.type))),
+        'Sandusky has no evidence authorizing an ownership transfer or consolidation');
+    }
+    const choice = p.options.find((o) => o.id === 'acknowledge');
+    assert(choice && choice.operations.length === 0);
+    assert.equal(ok(await post(local, 'decision', {
+      id: p.id, version: p.version, optionId: choice.id, action: 'approve',
+      note: p.quality.category === 'account_overlap'
+        ? 'Address overlap does not confirm ownership. Keep these accounts separate pending owner verification.'
+        : p.quality.category === 'shared_email'
+          ? 'The email may be a shared inbox. Confirm details with the owner before making any contact correction.'
+          : 'Account history stays intact. Confirm where this contact belongs before a separately reviewed contact edit.',
+    })).status, 'applied');
+    approved.push(p.id);
+  }
+  assert.equal(hosted.writes.length, writesBeforeFollowups, 'Acknowledging an unresolved follow-up cannot write to CRM');
+  assert.deepEqual(hosted.data.accounts, accountsBeforeFollowups);
+  assert.deepEqual(hosted.data.contacts, originalContacts);
   const writesAfterReview = hosted.writes.length;
   const contactsAfterReview = structuredClone(hosted.data.contacts);
   const accountsAfterReview = structuredClone(hosted.data.accounts);

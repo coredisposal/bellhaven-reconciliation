@@ -97,9 +97,30 @@ test('judgment: confirmed existing identity corrects its address and follows eve
       }
       assert.deepEqual(hosted.data.contacts, contacts);
       const writes = hosted.writes.length;
-      assert.equal(ok(await post(local, 'pipeline', {})).new_proposals, 0);
+      assert.equal(ok(await post(local, 'pipeline', {})).new_proposals, isChow ? 1 : 0);
+      if (isChow) {
+        const followups = (await current(local)).proposals.filter((row) => row.current &&
+          row.key === `quality:retired-contacts:${before.account_id}`);
+        assert.equal(followups.length, 1, 'A CHOW leaves a distinct contact-history follow-up');
+        const followup = followups[0];
+        assert.equal(followup.kind, 'crm_quality');
+        assert.equal(followup.quality.category, 'retired_contact');
+        assert(followup.quality.contacts.some((c) => c.account_id === before.account_id && c.is_active !== false));
+        assert(followup.options.every((o) => o.operations.length === 0));
+        const acknowledge = followup.options.find((o) => o.id === 'acknowledge');
+        assert(acknowledge);
+        ok(await approve(local, followup, acknowledge,
+          'Preserve the historical account and its contacts; confirm any contact reassignment separately.'));
+      }
+      for (let i = 0; i < 2; i++) {
+        assert.equal(ok(await post(local, 'pipeline', {})).new_proposals, 0);
+        const decided = (await current(local)).proposals.find((row) => row.id === p.id);
+        assert.equal(decided.status, 'applied');
+        assert.equal(decided.current, true, 'Contact follow-up cannot replace the approved facility case');
+      }
       assert.equal(await amberly(local), undefined);
       assert.equal(hosted.writes.length, writes);
+      assert.deepEqual(hosted.data.contacts, contacts);
     });
   }
 });

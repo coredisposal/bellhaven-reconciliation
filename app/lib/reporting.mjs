@@ -1,4 +1,4 @@
-import { reconcile } from './core.mjs';
+import { reconcile } from './reconciliation.mjs';
 
 // Reporting is read-only. Keep the accounting grain explicit: current cases are
 // reconstructed from one complete snapshot, not counted across proposal history.
@@ -64,7 +64,7 @@ SELECT case_key,proposal_id,kind,state FROM current_cases WHERE position=1)`;
 /** Resolve the saved row for each current source case consistently across UI and reporting. */
 export async function currentCaseRows(db, snapshot) {
   if (!snapshot) return [];
-  const cases = await reconcile(snapshot);
+  const cases = await reconcile(snapshot, db);
   return (await db.prepare(CURRENT)
     .bind(JSON.stringify(cases.map(({ id, key, kind, compatibility_version }) => ({ id, key, kind, compatibility_version }))))
     .all()).results;

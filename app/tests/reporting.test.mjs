@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, readdirSync } from 'node:fs';
-import { reconcile } from '../lib/core.mjs';
+import { reconcile } from '../lib/reconciliation.mjs';
 import { operationalReport } from '../lib/reporting.mjs';
 import baseline from '../fixtures/baseline.json' with { type: 'json' };
 
@@ -44,7 +44,7 @@ function setup() {
         JSON.stringify(snapshot ? { snapshot } : { error: 'source unavailable' })
       );
   const insertProposals = async (snapshot, runId, created = AT) => {
-    const rows = await reconcile(snapshot);
+    const rows = await reconcile(snapshot, db);
     for (const p of rows)
       sqlite
         .prepare('INSERT OR IGNORE INTO proposals VALUES(?,?,?,?,?,?,?)')
@@ -85,13 +85,15 @@ function snapshot({ legacy = true, absent = false, complete = true } = {}) {
     postal_code: '12345',
     care_offerings: ['Assisted Living'],
     administrator: 'Alex Example',
-    phone_raw: '555-0100',
+    phone_raw: '216-555-0100',
     source_url: 'https://example.invalid/communities/example',
   };
   const parent = {
     account_id: 'parent',
     name: 'Bellhaven Senior Living (Parent Account)',
     parent_id: '',
+    lifetime_revenue: 0,
+    outstanding_ar: 0,
   };
   const account = {
     account_id: 'account',
@@ -168,17 +170,59 @@ test('current grain counts one website case plus an absent account, separate fro
   ]);
 });
 
-test('exercise baseline reports 38 current cases and 35 website facilities without counting proposal history', async () => {
+test('exercise baseline reports 38 facility cases plus four CRM-quality cases without changing the facility denominator', async () => {
   const s = setup();
   s.insertRun('baseline', baseline);
-  await s.insertProposals(baseline, 'baseline');
+  const cases = await s.insertProposals(baseline, 'baseline');
+  assert.equal(cases.filter((p) => p.kind !== 'crm_quality').length, 38);
+  assert.deepEqual(cases.filter((p) => p.kind === 'crm_quality').map((p) => p.quality.category).sort(), [
+    'account_overlap', 'retired_contact', 'retired_contact', 'shared_email',
+  ]);
   const r = await operationalReport(s.db, AT);
-  assert.equal(r.current.total, 38);
+  assert.equal(r.current.total, 42);
   assert.equal(r.source.counts.facilities, 35);
   assert.equal(r.source.counts.accounts, 121);
   assert.equal(r.source.counts.contacts, 67);
-  assert.equal(r.current.review_backlog, 37);
+  assert.equal(r.current.review_backlog, 41);
   assert.equal(r.current.unchanged, 1);
+  assert.deepEqual(r.current.by_kind.find((row) => row.kind === 'crm_quality'), { kind: 'crm_quality', total: 4 });
+  assert.equal(r.current.missing_ledger_rows, 0);
+});
+
+test('CRM-quality acknowledgement needs a verified no-write audit and stays closed across report reruns', async (t) => {
+  const s = setup(), data = snapshot({ legacy: false });
+  t.after(() => s.sqlite.close());
+  data.accounts[1].billing_street = data.facilities[0].street_address;
+  data.contacts = [
+    { contact_id: 'one', account_id: 'account', name: 'Alex Example', email: 'shared@example.invalid', is_active: true },
+    { contact_id: 'two', account_id: 'account', name: 'Jordan Example', email: 'shared@example.invalid', is_active: true },
+  ];
+  s.insertRun('first', data);
+  const cases = await s.insertProposals(data, 'first'), quality = cases.find((p) => p.kind === 'crm_quality');
+  assert.equal(cases.length, 2);
+  assert.equal(quality.quality.category, 'shared_email');
+  assert.deepEqual(quality.options[0].operations, []);
+  s.approveAndVerify(quality);
+  let report = await operationalReport(s.db, AT);
+  assert.equal(report.current.verification_required, 1, 'Applied status and approval alone do not verify a no-write review');
+  assert.equal(report.history.verified_applied_cases, 0);
+  s.sqlite.prepare('INSERT INTO audits VALUES(?,?,?,?,?)').run(
+    'review-verified', quality.id, 'field_selection_verified', JSON.stringify({ field_choices: {} }), AT
+  );
+  const repeated = { ...data, retrieved_at: '2026-10-10T13:00:00.000Z' };
+  s.insertRun('second', repeated, { started: repeated.retrieved_at });
+  await s.insertProposals(repeated, 'second', repeated.retrieved_at);
+  report = await operationalReport(s.db, repeated.retrieved_at);
+  assert.equal(report.current.total, 2);
+  assert.deepEqual(report.current.by_kind, [{ kind: 'crm_quality', total: 1 }, { kind: 'unchanged', total: 1 }]);
+  assert.equal(report.source.counts.facilities, 1);
+  assert.equal(report.source.counts.contacts, 2);
+  assert.equal(report.current.applied, 1);
+  assert.equal(report.current.unchanged, 1);
+  assert.equal(report.current.review_backlog, 0);
+  assert.equal(report.current.missing_ledger_rows, 0);
+  assert.equal(report.history.verified_applied_cases, 1);
+  assert.equal(s.sqlite.prepare('SELECT COUNT(*) AS total FROM operations').get().total, 0);
 });
 
 test('unchanged reruns and persisted rejection count one case even though proposal belongs to original run', async () => {

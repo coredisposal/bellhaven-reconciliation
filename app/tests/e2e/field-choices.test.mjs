@@ -219,5 +219,25 @@ test('field choices: interrupted CHOW keeps the approved replacement category an
   for (const write of hosted.writes.filter((w) => w.id === old.account_id))
     assert.deepEqual(write.fields, { chow_current_account: replacement.account_id });
   assert.deepEqual(hosted.data.contacts, contacts);
+  const writes = hosted.writes.length;
+  const oldContacts = contacts.filter((c) => c.account_id === old.account_id && c.is_active !== false);
+  assert(oldContacts.length > 0, 'This Findlay scenario includes contacts on the preserved account');
+  assert.equal(ok(await post(local, 'pipeline', {})).new_proposals, 1,
+    'Preserved contacts produce one distinct follow-up, not a new field-choice decision');
+  const followups = (await get(local, 'state')).proposals.filter((row) => row.current &&
+    row.key === `quality:retired-contacts:${old.account_id}`);
+  assert.equal(followups.length, 1);
+  const followup = followups[0];
+  assert.equal(followup.kind, 'crm_quality');
+  assert.equal(followup.quality.category, 'retired_contact');
+  assert.deepEqual(followup.quality.contacts.filter((c) => c.account_id === old.account_id && c.is_active !== false)
+    .map((c) => c.contact_id).sort(), oldContacts.map((c) => c.contact_id).sort());
+  assert(followup.options.every((o) => o.operations.length === 0));
+  const acknowledge = followup.options.find((o) => o.id === 'acknowledge');
+  assert(acknowledge);
+  ok(await post(local, 'decision', { ...approval(followup, acknowledge),
+    note: 'Keep contacts on the historical account pending separately verified contact reassignment.' }));
+  assert.equal(hosted.writes.length, writes, 'Recording contact follow-up does not alter CRM records');
+  assert.deepEqual(hosted.data.contacts, contacts);
   await assertDurable(hosted, local, p, selected);
 });

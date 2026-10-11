@@ -71,6 +71,34 @@ async function approve(s, p, choice) {
   assert(choice, 'Expected a stored reviewer resolution');
   return decide(s.ledger, s.client, s.getSnapshot, input(p, choice), identity);
 }
+async function assertChowContactFollowupClosed(s, p) {
+  const key = `quality:retired-contacts:${s.original.account_id}`;
+  const beforeContacts = copy(s.data.contacts), beforeWrites = copy(s.writes);
+  assert.equal((await runPipeline(s.ledger, s.getSnapshot)).new_proposals, 1);
+  const state = await reviewState(s.ledger, 'live');
+  const original = state.proposals.find((proposal) => proposal.id === p.id);
+  assert.equal(original.status, 'applied');
+  assert.equal(original.current, true, 'The original CHOW decision remains closed');
+  assert.deepEqual(state.proposals.filter((proposal) => proposal.current && proposal.status === 'pending').map((proposal) => proposal.key), [key]);
+  const followup = state.proposals.find((proposal) => proposal.key === key);
+  assert.equal(followup.kind, 'crm_quality');
+  assert.equal(followup.quality.category, 'retired_contact');
+  assert.deepEqual(followup.quality.contacts.filter((c) => c.account_id === s.original.account_id).map((c) => c.contact_id), beforeContacts.filter((c) => c.account_id === s.original.account_id).map((c) => c.contact_id));
+  assert.equal((await runPipeline(s.ledger, s.getSnapshot)).new_proposals, 0, 'The follow-up is offered once');
+  const acknowledge = followup.options.find((option) => option.id === 'acknowledge');
+  assert.deepEqual(acknowledge.operations, []);
+  await approve(s, followup, acknowledge);
+  s.ledger = new Ledger(s.d1);
+  for (let i = 0; i < 2; i++) assert.equal((await runPipeline(s.ledger, s.getSnapshot)).new_proposals, 0);
+  const after = await reviewState(s.ledger, 'live');
+  for (const id of [p.id, followup.id]) {
+    const proposal = after.proposals.find((item) => item.id === id);
+    assert.equal(proposal.status, 'applied');
+    assert.equal(proposal.current, true);
+  }
+  assert.deepEqual(s.writes, beforeWrites, 'Acknowledgement makes no CRM writes');
+  assert.deepEqual(s.data.contacts, beforeContacts, 'Contact migration remains outside CHOW approval');
+}
 
 test('judgment: a separate-account decision stays closed across reruns and is visible in the shared state and report', async (t) => {
   const s = setup(t), before = copy(s.original);
@@ -163,8 +191,7 @@ test('judgment: existing-account resolution with revenue and AR uses CHOW and pr
   assert.deepEqual(s.data.contacts, contacts);
   assert.equal(s.writes.length, 2);
   assert.deepEqual(s.writes[1].fields, { chow_current_account: target.account_id });
-  assert.equal((await runPipeline(s.ledger, s.getSnapshot)).new_proposals, 0);
-  assert.equal((await runPipeline(s.ledger, s.getSnapshot)).new_proposals, 0);
+  await assertChowContactFollowupClosed(s, p);
   assert.equal(s.writes.length, 2);
 });
 
@@ -281,6 +308,5 @@ test('judgment: update-only option for a billing survivor follows CHOW and never
   assert.deepEqual(s.original, { ...original, chow_current_account: s.writes[0].id });
   assert.deepEqual(s.writes[1].fields, { chow_current_account: s.writes[0].id });
   assert.deepEqual(s.data.accounts.find((a) => a.account_id === 'other-copy'), other);
-  for (let i = 0; i < 2; i++)
-    assert.equal((await runPipeline(s.ledger, s.getSnapshot)).new_proposals, 0);
+  await assertChowContactFollowupClosed(s, p);
 });

@@ -269,8 +269,10 @@ test('local to hosted: ordinary parent, duplicate, absence, address and uncertai
     ['Union Square', 'new_account'],
     ['Batavia', 'new_account'],
   ];
+  const reviewedKeys = new Map();
   for (const [title, kind] of cases) {
     const p = await proposal(local, title);
+    reviewedKeys.set(p.key, { id: p.id, kind, status: title === 'Amberly Manor' ? 'rejected' : 'applied' });
     assert.equal(p.kind, kind);
     if (title === 'Amberly Manor') {
       const writes = hosted.writes.length;
@@ -331,8 +333,20 @@ test('local to hosted: ordinary parent, duplicate, absence, address and uncertai
   assert.equal(ok(await post(local, 'pipeline', {})).new_proposals, 0);
   assert.equal(hosted.writes.length, writes);
   const state = await get(local, 'state');
-  for (const [title] of cases)
-    assert(!state.proposals.some((p) => p.title.includes(title) && p.status === 'pending'), title);
+  for (const [key, { id, kind, status }] of reviewedKeys) {
+    assert.equal(state.proposals.find((p) => p.id === id)?.status, status,
+      `${key}: preserve the original decision in history`);
+    assert(!state.proposals.some((p) => p.key === key && ['pending', 'stale', 'partial', 'applying'].includes(p.status)),
+      `${key}: no repeat decision is requested`);
+    const reviewed = state.proposals.filter((p) => p.current && p.key === key);
+    if (kind === 'absent') {
+      assert.equal(reviewed.length, 0, `${key}: resolved website absence leaves the current queue`);
+      continue;
+    }
+    assert.equal(reviewed.length, 1, `${key}: one current facility case`);
+    assert([status, ...(status === 'applied' ? ['unchanged'] : [])].includes(reviewed[0].status),
+      `${key}: no repeat facility decision is requested`);
+  }
 });
 
 test('local to hosted: Locations exposes complete saved scraper output independently of review decisions and recent run limits', async (t) => {

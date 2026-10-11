@@ -10,7 +10,7 @@ export function selectedOption(proposal, decisions, requested = '') {
   }
   if (requested === 'reject' && proposal.status === 'pending') return 'reject';
   if (proposal.options.some((o) => o.id === requested)) return requested;
-  return proposal.kind === 'ambiguous' ? '' : (proposal.options[0]?.id ?? '');
+  return ['ambiguous', 'crm_quality'].includes(proposal.kind) ? '' : (proposal.options[0]?.id ?? '');
 }
 
 /** A repeated manual draft keeps its original decision; open the view containing it. */

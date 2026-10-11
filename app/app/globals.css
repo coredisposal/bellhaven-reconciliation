@@ -644,6 +644,57 @@ textarea::placeholder {
   margin-top: 10px;
   max-width: 75ch;
 }
+.quality-contacts,
+.quality-preview {
+  margin-block: 24px;
+  font-size: 13px;
+}
+.quality-contacts h3,
+.quality-preview h3,
+.quality-source h3 {
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+.quality-contacts h3 > span {
+  color: var(--muted);
+  font-weight: 400;
+  margin-left: 6px;
+}
+.quality-contacts ul {
+  padding: 0;
+  list-style: none;
+}
+.quality-contacts li {
+  border-bottom: 1px solid var(--line);
+  padding-block: 12px;
+  overflow-wrap: anywhere;
+}
+.quality-contacts li > span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.quality-preview > p {
+  max-width: 75ch;
+}
+.quality-operation {
+  margin-top: 20px;
+}
+.quality-operation > p {
+  overflow-wrap: anywhere;
+  margin-bottom: 10px;
+}
+.quality-note p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-bottom: 12px;
+  font-size: 12px;
+}
+.badge.crm_quality {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
 @media (max-width: 760px) {
   .account-impact thead {
     position: absolute;
