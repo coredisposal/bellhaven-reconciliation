@@ -39,6 +39,7 @@ export interface Candidate {
 }
 export type Operation =
   | { type: 'create'; account_id?: never; before?: CrmRecord | null; fields: CrmFields }
+  | { type: 'chow_link'; account_id: string; before: CrmRecord; fields: CrmFields & { chow_current_account: string }; dependencies: CrmRecord[] }
   | { type: 'patch' | 'chow' | 'duplicate'; account_id: string; before: CrmRecord; fields: CrmFields }
   | { type: 'update'; account_id?: string; before: CrmRecord; fields: CrmFields };
 export interface ReviewOption {
@@ -78,6 +79,7 @@ export interface Proposal {
   facility: Facility | null;
   parent?: Account;
   manual?: boolean;
+  relationship?: { type: 'chow' | 'duplicate'; target_id: string };
   entity?: string;
   before?: CrmRecord;
   fields?: CrmFields;

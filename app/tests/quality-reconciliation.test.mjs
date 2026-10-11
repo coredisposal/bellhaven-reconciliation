@@ -5,6 +5,11 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { reconcile as facilityReconciliation } from '../lib/core.mjs';
 import { reconcile } from '../lib/reconciliation.mjs';
 import { sqliteD1 } from './helpers/sqlite-d1.mjs';
+import { Ledger } from '../lib/ledger.mjs';
+import { decide, runPipeline } from '../lib/engine.mjs';
+import { reviewState } from '../lib/state.mjs';
+import { operationalReport } from '../lib/reporting.mjs';
+import { selectedOption } from '../lib/review-selection.mjs';
 
 const parent = { account_id: 'parent', name: 'Bellhaven Senior Living (Parent Account)', status: 'Active', lifetime_revenue: 0, outstanding_ar: 0 };
 const account = (id, changes = {}) => ({ account_id: id, name: 'Example Manor', parent_id: parent.account_id, status: 'Active', billing_street: '100 N Main St', billing_city: 'Example', billing_state: 'OH', billing_zip: '44000', phone: '(216) 555-0100', care_type: 'Assisted Living', lifetime_revenue: 0, outstanding_ar: 0, ...changes });
@@ -109,4 +114,216 @@ test('quality reconciliation holds interrupted manual operation accounts when ca
   };
   store(s, p, 'partial');
   assert.equal((await reconcile(s.snapshot, s.db)).filter((p) => p.kind === 'crm_quality').length, 0, 'Operation account IDs must protect interrupted manual work before a checkpoint exists');
+});
+
+async function reviewSetup(t) {
+  const s = setup(t), ledger = new Ledger(s.db), writes = [];
+  const getSnapshot = async () => structuredClone(s.snapshot);
+  const client = {
+    accounts: async () => structuredClone(s.snapshot.accounts),
+    contacts: async () => structuredClone(s.snapshot.contacts),
+    get: async (id) => structuredClone(s.snapshot.accounts.find((a) => a.account_id === id)),
+    patch: async (id, fields) => {
+      writes.push({ id, fields });
+      const row = s.snapshot.accounts.find((a) => a.account_id === id);
+      Object.assign(row, fields);
+      return structuredClone(row);
+    },
+    create: async () => { throw new Error('Creation is outside this review'); },
+  };
+  const decision = (p, action, option, note = 'Keep this unanswered verification task available for follow-up.') =>
+    decide(ledger, client, getSnapshot, { id: p.id, version: p.version, action, optionId: option?.id, note }, { actor: 'reviewer', session: 'review-session' });
+  await runPipeline(ledger, getSnapshot);
+  const p = websiteFields(await reconcile(s.snapshot, s.db))[0];
+  const keep = p.options.find((option) => !option.operations.length);
+  const update = p.options.find((option) => option.operations.length);
+  return { ...s, ledger, client, writes, getSnapshot, decision, p, keep, update };
+}
+
+async function chowLinkSetup(t) {
+  const s = await reviewSetup(t);
+  s.snapshot.accounts = [{ ...parent },
+    { ...parent, account_id: 'other-parent', name: 'Other Operator (Parent Account)' },
+    account('old', { lifetime_revenue: 130000, outstanding_ar: 5200, status: 'Needs Review' }),
+    account('successor', { name: 'Successor Manor', parent_id: 'other-parent' }),
+  ];
+  s.snapshot.facilities = [];
+  s.snapshot.coverage = { complete: true, expected: 0, found: 0, urls: [] };
+  await runPipeline(s.ledger, s.getSnapshot);
+  const p = (await reconcile(s.snapshot, s.db)).find((p) => p.kind === 'crm_quality' && p.quality.category === 'account_overlap');
+  const link = p.options.find((o) => o.operations.some((op) => op.type === 'chow_link'));
+  assert(link);
+  return { ...s, p, link };
+}
+
+test('automatic CHOW successor link preserves all original fields and repeat runs never recreate the overlap', async (t) => {
+  const s = await chowLinkSetup(t), before = structuredClone(s.snapshot);
+  await assert.rejects(s.decision(s.p, 'approve', s.link, ''), /Explain your resolution/);
+  assert.deepEqual(await s.decision(s.p, 'approve', s.link), { status: 'applied' });
+  assert.deepEqual(s.writes, [{ id: 'old', fields: { chow_current_account: 'successor' } }]);
+  assert.deepEqual(s.snapshot.accounts, before.accounts.map((a) => a.account_id === 'old' ? { ...a, chow_current_account: 'successor' } : a));
+  await assert.rejects(s.decision(s.p, 'reopen', s.link), /Only rejected/);
+  for (let i = 0; i < 2; i++) {
+    assert.equal((await runPipeline(s.ledger, s.getSnapshot)).new_proposals, 0);
+    assert(!(await reviewState(s.ledger, 'live')).proposals.some((p) => p.key === s.p.key && p.status === 'pending'));
+  }
+  assert.equal(s.writes.length, 1);
+});
+
+test('automatic CHOW link invalidates on changed source, successor or parent evidence before writing', async (t) => {
+  for (const [id, fields] of [['old', { outstanding_ar: 0 }], ['successor', { phone: 'changed' }], ['other-parent', { name: 'Changed owner' }], ['parent', { status: 'Inactive' }]]) await t.test(id, async (t) => {
+    const s = await chowLinkSetup(t);
+    Object.assign(s.snapshot.accounts.find((a) => a.account_id === id), fields);
+    await assert.rejects(s.decision(s.p, 'approve', s.link), /Evidence changed|parent/i);
+    assert.equal(s.writes.length, 0);
+  });
+});
+
+test('automatic CHOW link checks dependencies again immediately before its patch', async (t) => {
+  const s = await chowLinkSetup(t), get = s.client.get;
+  s.client.get = async (id) => {
+    if (id === 'successor') s.snapshot.accounts.find((a) => a.account_id === id).phone = 'Changed after approval';
+    return get(id);
+  };
+  await assert.rejects(s.decision(s.p, 'approve', s.link), /successor or parent evidence changed/);
+  assert.equal(s.writes.length, 0);
+  assert.equal(s.sql.prepare('SELECT status FROM proposals WHERE id=?').get(s.p.id).status, 'partial');
+});
+
+test('automatic CHOW link withholds new incoming relationships discovered at the write boundary', async (t) => {
+  for (const relationship of ['parent_id', 'chow_current_account']) await t.test(relationship, async (t) => {
+    const s = await chowLinkSetup(t), get = s.client.get;
+    s.client.get = async (id) => {
+      if (id === 'successor') s.snapshot.accounts.push(account('new-related', { billing_street: '200 Other St', [relationship]: 'successor' }));
+      return get(id);
+    };
+    await assert.rejects(s.decision(s.p, 'approve', s.link), /Parent accounts|historical links/);
+    assert.equal(s.writes.length, 0);
+  });
+});
+
+test('automatic CHOW link withholds billing drift between individual reads and final inventory', async (t) => {
+  const s = await chowLinkSetup(t), accounts = s.client.accounts;
+  s.client.accounts = async () => {
+    s.snapshot.accounts.find((a) => a.account_id === 'old').outstanding_ar = 0;
+    return accounts();
+  };
+  await assert.rejects(s.decision(s.p, 'approve', s.link), /write boundary/);
+  assert.equal(s.writes.length, 0);
+});
+
+test('automatic CHOW link resumes after interrupted patch and reconciles a lost successful response', async (t) => {
+  for (const lostResponse of [false, true]) await t.test(lostResponse ? 'lost successful response' : 'interrupted patch', async (t) => {
+    const s = await chowLinkSetup(t), patch = s.client.patch;
+    let attempts = 0;
+    s.client.patch = async (id, fields) => {
+      attempts++;
+      if (lostResponse) await patch(id, fields);
+      throw new Error('Simulated upstream timeout');
+    };
+    if (lostResponse) assert.deepEqual(await s.decision(s.p, 'approve', s.link), { status: 'applied' });
+    else {
+      await assert.rejects(s.decision(s.p, 'approve', s.link), /Patch not verified/);
+      s.client.patch = async (...args) => { attempts++; return patch(...args); };
+      assert.deepEqual(await s.decision(s.p, 'resume', undefined), { status: 'applied' });
+    }
+    assert.equal(attempts, lostResponse ? 1 : 2);
+    assert.equal(s.writes.length, 1);
+    assert.equal(s.snapshot.accounts.find((a) => a.account_id === 'old').chow_current_account, 'successor');
+  });
+});
+
+test('automatic CHOW link refuses interrupted recovery with changed successor evidence', async (t) => {
+  const s = await chowLinkSetup(t), patch = s.client.patch;
+  s.client.patch = async () => { throw new Error('Simulated timeout'); };
+  await assert.rejects(s.decision(s.p, 'approve', s.link), /Patch not verified/);
+  s.client.patch = patch;
+  s.snapshot.accounts.find((a) => a.account_id === 'successor').outstanding_ar = 10;
+  await assert.rejects(s.decision(s.p, 'resume', undefined), /evidence changed/i);
+  assert.equal(s.writes.length, 0);
+});
+
+test('quality review acknowledgment can reopen with audit, survive reruns, and approve a different stored choice', async (t) => {
+  const s = await reviewSetup(t), before = structuredClone(s.snapshot);
+  await s.decision(s.p, 'approve', s.keep);
+  const firstDecision = s.sql.prepare("SELECT id FROM decisions WHERE action='approve'").get();
+  await assert.rejects(s.decision(s.p, 'reopen', s.keep, ' '), /Explain why/);
+  await assert.rejects(s.decision(s.p, 'reopen', s.update), /does not match the saved review/);
+  assert.equal(s.sql.prepare('SELECT COUNT(*) AS n FROM decisions').get().n, 1);
+  assert.deepEqual(await s.decision(s.p, 'reopen', undefined), { status: 'pending' });
+  assert.deepEqual(s.snapshot, before);
+  assert.equal(s.writes.length, 0);
+  assert.equal(s.sql.prepare('SELECT COUNT(*) AS n FROM operations').get().n, 0);
+  for (let pass = 0; pass < 2; pass++) {
+    assert.equal((await runPipeline(s.ledger, s.getSnapshot)).new_proposals, 0);
+    const state = await reviewState(s.ledger, 'live');
+    assert.equal(state.proposals.find((p) => p.id === s.p.id && p.current)?.status, 'pending');
+    const report = await operationalReport(s.db);
+    assert.equal(report.current.review_backlog, 1);
+    assert.equal(report.current.verification_required, 0);
+  }
+  await assert.rejects(s.decision(s.p, 'reopen', s.keep), /Only rejected/);
+  await s.decision(s.p, 'approve', s.update);
+  assert.equal(s.writes.length, 1, 'Only the newly approved correction writes to CRM');
+  // Force timestamps and UUID ordering to disagree with insertion order.
+  s.sql.prepare("UPDATE decisions SET created='2026-10-11T10:00:00.000Z'").run();
+  s.sql.prepare("UPDATE decisions SET id='zz-old-approval' WHERE id=?").run(firstDecision.id);
+  const second = s.sql.prepare("SELECT id FROM decisions WHERE action='approve' ORDER BY rowid DESC LIMIT 1").get();
+  s.sql.prepare("UPDATE decisions SET id='aa-new-approval' WHERE id=?").run(second.id);
+  const state = await reviewState(s.ledger, 'live');
+  assert.equal(selectedOption(state.proposals.find((p) => p.id === s.p.id), state.decisions), s.update.id);
+  assert.equal((await operationalReport(s.db)).history.verified_applied_cases, 1);
+  assert.deepEqual(state.decisions.filter((d) => d.proposal_id === s.p.id).map((d) => d.action), ['approve', 'reopen', 'approve']);
+  const audit = state.audits.find((a) => a.proposal_id === s.p.id && a.event === 'case_reopened');
+  assert.equal(audit.data.previous_status, 'applied');
+  assert.equal(audit.data.previous_option, s.keep.id);
+  assert.equal(audit.data.crm_writes, 0);
+  await assert.rejects(s.decision(s.p, 'reopen', s.keep), /Only rejected/);
+  assert.equal(s.writes.length, 1);
+});
+
+test('quality review reopen requires its persisted zero-write approval and no operation checkpoints', async (t) => {
+  for (const corrupt of ['missing approval', 'non-quality case', 'checkpoint', 'missing choice']) await t.test(corrupt, async (t) => {
+    const s = await reviewSetup(t);
+    await s.decision(s.p, 'approve', s.keep);
+    if (corrupt === 'missing approval') s.sql.prepare('DELETE FROM decisions').run();
+    if (corrupt === 'non-quality case') {
+      const row = JSON.parse(s.sql.prepare('SELECT data FROM proposals WHERE id=?').get(s.p.id).data);
+      row.kind = 'field_correction';
+      s.sql.prepare('UPDATE proposals SET data=? WHERE id=?').run(JSON.stringify(row), s.p.id);
+    }
+    if (corrupt === 'missing choice') s.sql.prepare("UPDATE decisions SET option_id='unknown-choice'").run();
+    if (corrupt === 'checkpoint') s.sql.prepare('INSERT INTO operations VALUES(?,?,?,?,?,?)').run('operation', s.p.id, 0, 'complete', '{}', '2026-10-11');
+    const before = s.sql.prepare('SELECT COUNT(*) AS n FROM decisions').get().n;
+    await assert.rejects(s.decision(s.p, 'reopen', s.keep), /Only rejected/);
+    assert.equal(s.sql.prepare('SELECT status FROM proposals WHERE id=?').get(s.p.id).status, 'applied');
+    assert.equal(s.sql.prepare('SELECT COUNT(*) AS n FROM decisions').get().n, before);
+    assert.equal(s.writes.length, 0);
+    assert.equal(s.sql.prepare('SELECT COUNT(*) AS n FROM locks').get().n, 0);
+  });
+});
+
+test('quality review concurrent reopen requests record exactly one audited transition', async (t) => {
+  const s = await reviewSetup(t);
+  await s.decision(s.p, 'approve', s.keep);
+  const results = await Promise.allSettled([s.decision(s.p, 'reopen', s.keep), s.decision(s.p, 'reopen', s.keep)]);
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+  assert.equal(s.sql.prepare("SELECT COUNT(*) AS n FROM decisions WHERE action='reopen'").get().n, 1);
+  assert.equal(s.sql.prepare("SELECT COUNT(*) AS n FROM audits WHERE event='case_reopened'").get().n, 1);
+  assert.equal(s.writes.length, 0);
+});
+
+test('a reopened quality review resumes its new interrupted approval instead of the older acknowledgment', async (t) => {
+  const s = await reviewSetup(t);
+  await s.decision(s.p, 'approve', s.keep);
+  await s.decision(s.p, 'reopen', s.keep);
+  const patch = s.client.patch;
+  s.client.patch = async () => { throw new Error('Simulated upstream patch interruption'); };
+  await assert.rejects(s.decision(s.p, 'approve', s.update), /Patch not verified/);
+  s.sql.prepare("UPDATE decisions SET created='2026-10-11T10:00:00.000Z'").run();
+  s.client.patch = patch;
+  assert.deepEqual(await s.decision(s.p, 'resume', undefined), { status: 'applied' });
+  assert.equal(s.writes.length, 1);
+  assert.equal(s.snapshot.accounts[1].phone, s.facility.phone_raw);
+  assert.equal((await operationalReport(s.db)).history.verified_applied_cases, 1);
 });

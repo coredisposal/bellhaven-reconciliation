@@ -7,6 +7,7 @@
 }
 .crm-search label,
 .crm-fields label,
+.crm-task,
 .crm-reason {
   display: flex;
   flex-direction: column;
@@ -20,6 +21,7 @@
 }
 .crm-search input,
 .crm-search select,
+.crm-task select,
 .crm-fields input,
 .crm-fields select {
   width: 100%;
@@ -84,6 +86,63 @@
 .crm-reason {
   margin: 20px 0 16px;
 }
+.crm-task {
+  margin: 20px 0 16px;
+  max-width: 420px;
+}
+.crm-relationship .crm-search {
+  margin-top: 16px;
+}
+.crm-target-results {
+  max-height: 250px;
+  overflow-y: auto;
+  margin: 12px 0;
+  border-block: 1px solid var(--line);
+}
+.crm-target-results .case-row {
+  max-width: none;
+  min-width: 0;
+}
+.crm-relationship-accounts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+  padding-block: 18px;
+  margin-top: 20px;
+  border-block: 1px solid var(--line);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.crm-relationship-accounts h4 {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+.crm-relationship-accounts strong,
+.crm-relationship-accounts .crm-record-id {
+  display: block;
+}
+.crm-relationship-accounts p {
+  line-height: 1.6;
+  margin: 8px 0;
+}
+.crm-relationship-accounts dl {
+  margin: 12px 0 0;
+}
+.crm-relationship-accounts dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+}
+.crm-relationship-accounts dt {
+  color: var(--muted);
+}
+.crm-relationship-accounts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
 .crm-billing {
   font-size: 13px;
   padding: 16px;
@@ -126,11 +185,15 @@
 @media (max-width: 760px) {
   .crm-search input,
   .crm-search select,
+  .crm-task select,
   .crm-fields input,
   .crm-fields select {
     font-size: 16px;
   }
   .crm-fields {
+    grid-template-columns: 1fr;
+  }
+  .crm-relationship-accounts {
     grid-template-columns: 1fr;
   }
   .crm-query {

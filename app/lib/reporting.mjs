@@ -16,7 +16,7 @@ const VERIFIED = `
     FROM json_each(p.data, '$.options') opt
     WHERE json_extract(opt.value, '$.id') = (
       SELECT d.option_id FROM decisions d WHERE d.proposal_id=p.id AND d.action='approve'
-      ORDER BY d.created DESC, d.id DESC LIMIT 1
+      ORDER BY d.rowid DESC LIMIT 1
     )
   )
   AND NOT EXISTS (

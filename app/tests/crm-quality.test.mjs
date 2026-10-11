@@ -26,6 +26,51 @@ test('quality checks cover all parents and retain the uniquely billed survivor',
   assert.deepEqual(input, before, 'Detection must not mutate CRM source data');
 });
 
+test('quality offers a conditional CHOW link to the existing unbilled successor without inferring ownership', async () => {
+  const old = account('old', { lifetime_revenue: 130000, outstanding_ar: 5200, status: 'Needs Review' });
+  const next = account('next', { name: 'Other Operator Facility', parent_id: parent.account_id });
+  const input = snapshot([old, next]), before = structuredClone(input);
+  const p = category(await crmQuality(input), 'account_overlap')[0];
+  const choice = p.options.find((o) => o.id === 'chow-link:old:next');
+  assert(choice);
+  assert.match(choice.label, /If ownership is confirmed/);
+  assert.equal(choice.operations.length, 1);
+  assert.deepEqual(choice.operations[0].fields, { chow_current_account: 'next' });
+  assert.equal(choice.operations[0].type, 'chow_link');
+  assert.deepEqual(choice.operations[0].dependencies.map((a) => a.account_id).sort(), ['bellhaven', 'legacy', 'next']);
+  assert(p.options.some((o) => o.id === 'flag'));
+  assert(p.options.some((o) => o.id === 'acknowledge'));
+  assert.deepEqual(input, before);
+  const reordered = structuredClone(input);
+  reordered.accounts.reverse().forEach((a) => { a.updated_at = 'later'; a.parent_name = 'Cache only'; });
+  assert.equal(category(await crmQuality(reordered), 'account_overlap')[0].version, p.version);
+  input.accounts.find((a) => a.account_id === 'legacy').name = 'Verified different parent identity';
+  assert.notEqual(category(await crmQuality(input), 'account_overlap')[0].version, p.version, 'Parent evidence is bound into the immutable choice');
+});
+
+test('quality CHOW suggestions withhold ambiguous history, bad parents and billing or address conflicts', async () => {
+  const old = account('old', { lifetime_revenue: 130000, outstanding_ar: 5200 });
+  const next = account('next', { parent_id: parent.account_id });
+  for (const change of [
+    (s) => { s.accounts.find((a) => a.account_id === 'next').lifetime_revenue = 1; },
+    (s) => { s.accounts.find((a) => a.account_id === 'next').outstanding_ar = -1; },
+    (s) => { s.accounts.find((a) => a.account_id === 'next').outstanding_ar = null; },
+    (s) => { s.accounts.find((a) => a.account_id === 'old').outstanding_ar = 0; },
+    (s) => { s.accounts.find((a) => a.account_id === 'next').billing_zip = '44001'; },
+    (s) => { s.accounts.find((a) => a.account_id === 'next').status = 'Needs Review'; },
+    (s) => { s.accounts.find((a) => a.account_id === 'legacy').status = 'Needs Review'; },
+    (s) => { s.accounts.find((a) => a.account_id === 'legacy').parent_id = 'old'; },
+    (s) => { s.accounts.find((a) => a.account_id === 'legacy').parent_id = 'missing'; },
+    (s) => { s.accounts.push(account('third')); },
+    (s) => { s.accounts.push(account('history', { chow_current_account: 'next', billing_street: '200 Main St' })); },
+  ]) {
+    const input = snapshot(structuredClone([old, next]));
+    input.accounts = structuredClone(input.accounts);
+    change(input);
+    assert(!(await crmQuality(input)).some((p) => p.options.some((o) => o.operations.some((op) => op.type === 'chow_link'))));
+  }
+});
+
 test('quality duplicates require affirmative corroboration and safe losing records', async () => {
   for (const change of [
     { name: 'Another Facility' }, { parent_id: 'bellhaven' }, { billing_zip: '44001' },

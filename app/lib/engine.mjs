@@ -22,6 +22,7 @@ import {
 import { reconcile } from './reconciliation.mjs';
 import { assertNoInterruptedOverlap } from './recovery-conflicts.mjs';
 import { isRecord, isAccount, isFacility } from './contracts.mjs';
+import { assertRelationship } from './account-relationships.mjs';
 const now = () => new Date().toISOString();
 /** @param {unknown} a @param {unknown} b */
 const same = (a, b) => canonical(a) === canonical(b);
@@ -216,13 +217,33 @@ export async function decide(ledger, client, getSnapshot, input, identity) {
     if (p.id !== row.id || p.version !== row.version)
       throw new Error('Stored proposal identity does not match its ledger version. Operator review is required.');
     if (action === 'reopen') {
-      if (!['rejected', 'stale'].includes(row.status))
-        throw new Error('Only rejected or stale cases can be reopened.');
+      let reviewedOption;
+      if (row.status === 'applied' && p.kind === 'crm_quality') {
+        /** @type {{option_id: string} | null} */
+        const approval = await ledger.one(
+          "SELECT option_id FROM decisions WHERE proposal_id=? AND action='approve' ORDER BY rowid DESC LIMIT 1",
+          id
+        );
+        // The persisted approval, never a client-selected alternative, proves
+        // this was only a review. An operation checkpoint rules out reopening.
+        const savedOption = p.options.find((option) => option.id === approval?.option_id);
+        if (savedOption?.operations.length === 0 && savedOption.field_choices &&
+            !(await ledger.one('SELECT id FROM operations WHERE proposal_id=? LIMIT 1', id)))
+          reviewedOption = savedOption;
+      }
+      if (!['rejected', 'stale'].includes(row.status) && !reviewedOption)
+        throw new Error('Only rejected or stale cases, or CRM quality reviews without CRM writes, can be reopened.');
+      if (reviewedOption && optionId && optionId !== reviewedOption.id)
+        throw new Error('The selected choice does not match the saved review. Reload the case.');
       if (!note?.trim()) throw new Error('Explain why the decision is being reopened.');
+      await ledger.fence(lock);
       await ledger.batch([
-        decisionStatement(input, identity),
+        decisionStatement(reviewedOption ? { ...input, optionId: reviewedOption.id } : input, identity),
         ["UPDATE proposals SET status='pending' WHERE id=?", id],
-        ledger.auditStatement('case_reopened', { note, actor: identity.actor }, id),
+        ledger.auditStatement('case_reopened', {
+          note, actor: identity.actor, previous_status: row.status,
+          ...(reviewedOption ? { previous_option: reviewedOption.id, crm_writes: 0 } : {}),
+        }, id),
       ]);
       return { status: 'pending' };
     }
@@ -243,7 +264,7 @@ export async function decide(ledger, client, getSnapshot, input, identity) {
         throw new Error('Only interrupted approved operations can resume.');
       /** @type {{option_id: string} | null} */
       const approval = await ledger.one(
-        "SELECT * FROM decisions WHERE proposal_id=? AND action='approve' ORDER BY created DESC LIMIT 1",
+        "SELECT * FROM decisions WHERE proposal_id=? AND action='approve' ORDER BY rowid DESC LIMIT 1",
         id
       );
       if (!approval) throw new Error('No persisted approval to resume.');
@@ -440,6 +461,28 @@ export async function decide(ledger, client, getSnapshot, input, identity) {
         } else {
           let current = await client.get(op.account_id);
           const expected = { ...op.before, ...fields };
+          if (op.type === 'chow_link') {
+            const dependencies = [];
+            for (const before of op.dependencies) {
+              const actual = await client.get(before.account_id);
+              if (!same(businessAccount(actual), businessAccount(before)))
+                throw new Error('CHOW successor or parent evidence changed; link withheld.');
+              dependencies.push(actual);
+            }
+            const target = dependencies.find((a) => a.account_id === fields.chow_current_account);
+            if (!target) throw new Error('CHOW successor evidence is missing; link withheld.');
+            const currentAccounts = await client.accounts();
+            for (const before of [current, ...dependencies]) {
+              const latest = currentAccounts.find((a) => a.account_id === before.account_id);
+              if (!latest || !same(businessAccount(latest), businessAccount(before)))
+                throw new Error('CHOW account evidence changed at the write boundary; link withheld.');
+            }
+            if (currentAccounts.some((a) => a.account_id !== op.account_id &&
+                [op.account_id, target.account_id].some((id) => a.chow_current_account === id || a.duplicate_of_account === id)))
+              throw new Error('CHOW source or successor has new historical links; link withheld.');
+            // Verify the unlinked source even when resuming a verified patch.
+            assertRelationship(op.before, target, currentAccounts, 'chow');
+          }
           if (op.type === 'duplicate') {
             if (!fields.duplicate_of_account) throw new Error('Duplicate operation has no survivor.');
             const survivor = await client.get(fields.duplicate_of_account),
@@ -534,6 +577,7 @@ async function sameApprovedOption(proposal, selected, fresh) {
       account_id: operation.account_id,
       fields: operation.fields,
       before: operation.before ? businessAccount(operation.before) : undefined,
+      ...(operation.type === 'chow_link' ? { dependencies: operation.dependencies.map(businessAccount) } : {}),
     })),
   });
   return fresh.options.some((option) =>
@@ -680,7 +724,11 @@ function isAccountPatch(value) {
 function isOperation(value) {
   if (!isRecord(value) || !isAccountPatch(value.fields)) return false;
   if (value.type === 'create') return value.before === undefined && value.account_id === undefined;
-  return ['chow', 'patch', 'duplicate'].includes(String(value.type)) &&
+  if (value.type === 'chow_link' && (
+      Object.keys(value.fields).length !== 1 || typeof value.fields.chow_current_account !== 'string' ||
+      !value.fields.chow_current_account || !Array.isArray(value.dependencies) ||
+      !value.dependencies.length || !value.dependencies.every(isAccount))) return false;
+  return ['chow', 'chow_link', 'patch', 'duplicate'].includes(String(value.type)) &&
     typeof value.account_id === 'string' && !!value.account_id && isAccount(value.before) &&
     value.before.account_id === value.account_id &&
     (value.type !== 'duplicate' || typeof value.fields.duplicate_of_account === 'string');

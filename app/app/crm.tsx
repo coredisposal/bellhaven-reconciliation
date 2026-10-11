@@ -7,6 +7,7 @@ import { formatBalance, reviewContext } from '../lib/case-context.mjs';
 import { requestJson } from '../lib/client-request.mjs';
 import { Search, Plus, ChevronLeft, ChevronRight } from 'lucide-react';
 type CrmResults = { data: CrmRecord[]; total: number; error?: string };
+type AccountTask = 'edit' | 'chow' | 'duplicate';
 const accountFields = [
   'name',
   'parent_id',
@@ -36,7 +37,31 @@ const labels: Record<string, string> = {
   note: 'CRM note',
   title: 'Title',
   email: 'Email',
+  chow_current_account: 'Current account (CHOW)',
+  duplicate_of_account: 'Duplicate of account',
 };
+
+function RelationshipAccounts({ source, target, type }: {
+  source: CrmRecord; target: CrmRecord; type: Exclude<AccountTask, 'edit'>;
+}) {
+  return <div className="crm-relationship-accounts" role="group" aria-label="Accounts in this relationship">
+    {[
+      { record: source, label: type === 'chow' ? 'Original · link only' : 'Duplicate · set Inactive' },
+      { record: target, label: type === 'chow' ? 'Existing successor · unchanged' : 'Survivor · unchanged' },
+    ].map(({ record, label }) => <section key={record.account_id}>
+      <h4>{label}</h4>
+      <strong>{record.name}</strong>
+      <span className="crm-record-id">{record.account_id}</span>
+      <p>Parent: {record.parent_name || record.parent_id || 'None'}<br />
+        {[record.billing_street, record.billing_city, record.billing_state, record.billing_zip].filter(Boolean).join(', ') || 'Address not recorded'}</p>
+      <dl>
+        <div><dt>Lifetime revenue</dt><dd>{formatBalance(record.lifetime_revenue)}</dd></div>
+        <div><dt>Outstanding AR</dt><dd>{formatBalance(record.outstanding_ar)}</dd></div>
+        <div><dt>Status</dt><dd>{record.status || 'Not recorded'}</dd></div>
+      </dl>
+    </section>)}
+  </div>;
+}
 export default function Crm({
   csrf,
   onDraft,
@@ -57,12 +82,28 @@ export default function Crm({
     [filters, setFilters] = useState<Record<string, string>>({}),
     [searched, setSearched] = useState(false),
     [submittedSearch, setSubmittedSearch] = useState({ query: '', filters: {} as Record<string, string> }),
+    [task, setTask] = useState<AccountTask>('edit'),
+    [targetQuery, setTargetQuery] = useState(''),
+    [targetSearch, setTargetSearch] = useState(''),
+    [targetPage, setTargetPage] = useState(1),
+    [targetResults, setTargetResults] = useState<CrmResults | null>(null),
+    [target, setTarget] = useState<CrmRecord | null>(null),
     [meta, setMeta] = useState<unknown>(null);
   const request = useRef<AbortController | null>(null);
   useEffect(() => () => request.current?.abort(), []);
   const fields = entity === 'accounts' ? accountFields : contactFields;
   const history = historicalAccount(record, entity);
-  const hasChanges = fields.some((key) => Object.hasOwn(form, key) && (creating || form[key] !== record?.[key]));
+  const hasChanges = task === 'edit'
+    ? fields.some((key) => Object.hasOwn(form, key) && (creating || form[key] !== record?.[key]))
+    : !!target;
+  function resetRelationship(next: AccountTask = 'edit') {
+    setTask(next);
+    setTarget(null);
+    setTargetQuery('');
+    setTargetSearch('');
+    setTargetPage(1);
+    setTargetResults(null);
+  }
   function begin(message: string) {
     if (request.current) return null;
     const controller = new AbortController();
@@ -117,19 +158,19 @@ export default function Crm({
     setReason('');
     setError('');
     setMeta(null);
+    resetRelationship();
   }
   async function loadRecord(id: string) {
     const controller = begin('Reading record…');
     if (!controller) return;
     try {
-      const d = await requestJson('/api/desk/crm?' + new URLSearchParams({ entity, id }), {
-        signal: controller.signal, errorMessage: 'The CRM record could not be loaded. Try again.',
-      }) as CrmRecord;
+      const d = await readRecord(entity, id, controller.signal);
       if (controller.signal.aborted) return;
       setRecord(d);
       setForm(d);
       setCreating(false);
       setReason('');
+      resetRelationship();
     } catch (e) {
       if (!controller.signal.aborted) setError((e as Error).message);
     } finally {
@@ -142,13 +183,47 @@ export default function Crm({
     setCreating(true);
     setReason('');
     setError('');
+    resetRelationship();
+  }
+  async function readRecord(recordEntity: string, id: string, signal: AbortSignal) {
+    return await requestJson('/api/desk/crm?' + new URLSearchParams({ entity: recordEntity, id }), {
+      signal, errorMessage: 'The CRM record could not be loaded. Try again.',
+    }) as CrmRecord;
+  }
+  async function searchTargets(next = 1, paginate = false) {
+    const controller = begin('Finding related accounts…');
+    if (!controller) return;
+    const q = paginate ? targetSearch : targetQuery.trim();
+    try {
+      const d = await requestJson('/api/desk/crm?' + new URLSearchParams({
+        entity: 'accounts', q, page: String(next), page_size: '20',
+      }), { signal: controller.signal, errorMessage: 'Related accounts could not be loaded. Try again.' }) as CrmResults;
+      if (controller.signal.aborted) return;
+      setTargetResults(d);
+      setTargetPage(next);
+      setTargetSearch(q);
+      setTarget(null);
+    } catch (e) {
+      if (!controller.signal.aborted) setError((e as Error).message);
+    } finally { finish(controller); }
+  }
+  async function selectTarget(id: string) {
+    const controller = begin('Reading related account…');
+    if (!controller) return;
+    setTarget(null);
+    try {
+      const d = await readRecord('accounts', id, controller.signal);
+      if (!controller.signal.aborted) setTarget(d);
+    } catch (e) {
+      if (!controller.signal.aborted) setError((e as Error).message);
+    } finally { finish(controller); }
   }
   async function stage() {
     if (history || !hasChanges || !reason.trim() || !csrf) return;
     const controller = begin('Saving proposal…');
     if (!controller) return;
     try {
-      const changes = Object.fromEntries(
+      const changes = task !== 'edit' ? {} : Object.fromEntries(
         fields
           .filter((k) => Object.hasOwn(form, k) && (creating || form[k] !== record?.[k]))
           .map((k) => [k, form[k]])
@@ -165,6 +240,7 @@ export default function Crm({
           recordId: record?.[entity === 'accounts' ? 'account_id' : 'contact_id'],
           fields: changes,
           note: reason,
+          ...(task !== 'edit' && target ? { relationship: { type: task, target_id: target.account_id } } : {}),
         }),
       }) as ApiResult;
       if (controller.signal.aborted) return;
@@ -330,9 +406,23 @@ export default function Crm({
                   : `${history ? 'Historical record' : 'Edit proposal'}: ${record?.name}`}
               </h3>
               <p className="evidence-foot">
-                Saving a proposal does not write to the CRM. Billing balances and history links
-                cannot be manually overwritten.
+                Save a proposal, then review and approve it. Billing balances remain protected.
               </p>
+              {record && entity === 'accounts' && !history && (
+                <label className="crm-task">
+                  Proposed action
+                  <select value={task} disabled={!!busy} onChange={(e) => {
+                    resetRelationship(e.target.value as AccountTask);
+                    setForm(record);
+                    setReason('');
+                    setError('');
+                  }}>
+                    <option value="edit">Edit account</option>
+                    <option value="chow">Link existing successor (CHOW)</option>
+                    <option value="duplicate">Mark as duplicate of another account</option>
+                  </select>
+                </label>
+              )}
               {record && entity === 'accounts' && (
                 <p className="crm-billing">
                   Revenue:{' '}
@@ -363,12 +453,59 @@ export default function Crm({
                         </button>
                       )}
                     </>
-                  ) : (
+                  ) : task === 'edit' ? (
                     '. A parent change with both positive requires a new account and CHOW link.'
-                  )}
+                  ) : '.'}
                 </p>
               )}
-              <div className="crm-fields">
+              {task !== 'edit' && record && !history ? (
+                <div className="crm-relationship">
+                  <p className="evidence-foot" id="relationship-help">
+                    {task === 'chow'
+                      ? 'Use an existing successor after confirming an ownership transfer. Only the original’s CHOW link changes; both accounts keep their parents, fields, and billing history.'
+                      : 'Choose the active survivor for a confirmed duplicate under the same parent. This account becomes Inactive and links to the survivor. Both accounts keep their billing history and contacts.'}
+                  </p>
+                  <form className="crm-search" onSubmit={(e) => { e.preventDefault(); searchTargets(); }}>
+                    <label className="crm-query">
+                      {task === 'chow' ? 'Find existing successor' : 'Find survivor account'}
+                      <input value={targetQuery} onChange={(e) => {
+                        setTargetQuery(e.target.value);
+                        setTarget(null);
+                        setTargetResults(null);
+                      }} placeholder="Search by account name" maxLength={200} disabled={!!busy} aria-describedby="relationship-help" />
+                    </label>
+                    <button className="secondary" disabled={!!busy || !targetQuery.trim()}><Search size={16} />Find account</button>
+                  </form>
+                  {targetResults && <>
+                    <div className="crm-target-results" role="group" aria-label="Related account search results">
+                      {targetResults.data.filter((candidate) => candidate.account_id !== record.account_id).map((candidate) => {
+                        const candidateHistory = historicalAccount(candidate);
+                        return <button key={candidate.account_id} className={'case-row ' + (target?.account_id === candidate.account_id ? 'selected' : '')}
+                          type="button" disabled={!!busy || !!candidateHistory}
+                          aria-pressed={target?.account_id === candidate.account_id}
+                          onClick={() => selectTarget(candidate.account_id ?? '')}>
+                          <span className="case-title">{candidate.name}</span>
+                          <span className="case-locality">{[candidate.billing_street, candidate.billing_city, candidate.billing_state].filter(Boolean).join(', ') || 'Address not recorded'}</span>
+                          <span className="crm-record-id">{candidate.account_id} · {candidate.status || 'Status not recorded'}{candidateHistory ? ' · Historical account' : ''}</span>
+                        </button>;
+                      })}
+                    </div>
+                    {targetResults.data.every((candidate) => candidate.account_id === record.account_id) &&
+                      <p className="evidence-foot" role="status">No other accounts on this page. Try another name{targetResults.total > 20 ? ' or the next page' : ''}.</p>}
+                    {targetResults.total > 20 && <div className="crm-pagination">
+                      <button type="button" className="secondary" disabled={!!busy || targetPage <= 1} onClick={() => searchTargets(targetPage - 1, true)}>Previous accounts</button>
+                      <span className="evidence-foot">Page {targetPage} of {Math.ceil(targetResults.total / 20)}</span>
+                      <button type="button" className="secondary" disabled={!!busy || targetPage * 20 >= targetResults.total} onClick={() => searchTargets(targetPage + 1, true)}>Next accounts</button>
+                    </div>}
+                  </>}
+                  {target && <RelationshipAccounts source={record} target={target} type={task} />}
+                  <p className="evidence-foot">
+                    {task === 'chow'
+                      ? 'Requires matching street and locality, different parents, and positive revenue and AR on the original. A shared address alone does not prove a transfer.'
+                      : 'Requires matching street and locality, the same parent, and zero revenue and AR on the account being retired.'}
+                  </p>
+                </div>
+              ) : <div className="crm-fields">
                 {fields.map((k) => (
                   <label key={k}>
                     {labels[k]}
@@ -422,7 +559,7 @@ export default function Crm({
                     )}
                   </label>
                 ))}
-              </div>
+              </div>}
               <label className="crm-reason">
                 Evidence and reason for this proposal
                 <textarea
@@ -431,7 +568,9 @@ export default function Crm({
                   value={reason}
                   onChange={(e) => setReason(e.target.value)}
                   maxLength={2000}
-                  placeholder="Explain the correction and cite the source you checked."
+                  placeholder={task === 'chow' ? 'Cite the transfer evidence, effective date if known, and why this account is the successor.'
+                    : task === 'duplicate' ? 'Cite the evidence that these records represent the same account and explain the survivor choice.'
+                    : 'Explain the correction and cite the source you checked.'}
                 />
               </label>
               <button
@@ -489,6 +628,10 @@ export function ManualCase({
   const historical = proposal.status !== 'pending';
   const linkedId = proposal.entity === 'contacts' ? fields.account_id ?? before.account_id : fields.parent_id ?? before.parent_id;
   const linkedRecord = proposal.dependencies?.find((record) => record.account_id === linkedId);
+  const relationship = proposal.relationship;
+  const relationshipTarget = relationship && proposal.dependencies?.find((record) => record.account_id === relationship.target_id);
+  const sourceParent = proposal.dependencies?.find((record) => record.account_id === before.parent_id);
+  const targetParent = proposal.dependencies?.find((record) => record.account_id === relationshipTarget?.parent_id);
   return (
     <section id="selected-case" tabIndex={-1} className="case-detail">
       <div className="case-status">
@@ -501,7 +644,7 @@ export function ManualCase({
       <p className="case-summary">{proposal.summary ?? proposal.note}</p>
       <p className="evidence-foot"><strong>{proposal.entity === 'contacts' ? 'Contact' : 'Account'}:</strong>{' '}
         {String(before.name || fields.name || proposal.title)} · {String((proposal.entity === 'contacts' ? before.contact_id : before.account_id) || 'New ID assigned on creation')}
-        {linkedId && <><br />{proposal.entity === 'contacts' ? 'Linked account' : 'Proposed parent'}: {linkedRecord?.name ? `${linkedRecord.name} · ` : ''}{String(linkedId)}</>}
+        {linkedId && <><br />{proposal.entity === 'contacts' ? 'Linked account' : relationship ? 'Existing parent' : 'Proposed parent'}: {linkedRecord?.name ? `${linkedRecord.name} · ` : ''}{String(linkedId)}</>}
       </p>
       {context.statusNotice && <p className="review-status-note">{context.statusNotice}</p>}
       <p className="manual-reason">
@@ -518,7 +661,15 @@ export function ManualCase({
           </strong>
         </div>
       )}
-      {proposal.entity === 'accounts' && proposal.before && (
+      {relationship && relationshipTarget && proposal.before && <>
+        <RelationshipAccounts type={relationship.type}
+          source={{ ...proposal.before, parent_name: sourceParent?.name ?? proposal.before.parent_name }}
+          target={{ ...relationshipTarget, parent_name: targetParent?.name ?? relationshipTarget.parent_name }} />
+        <p className="crm-billing">{relationship.type === 'chow'
+          ? 'Link the original to this existing successor. No new account is created. Both parents, billing balances, other business fields, and contacts remain unchanged.'
+          : 'Set only the duplicate’s status to Inactive and link it to this survivor. The survivor, both billing histories, and contacts remain unchanged.'}</p>
+      </>}
+      {!relationship && proposal.entity === 'accounts' && proposal.before && (
         <p className="crm-billing">
           Existing lifetime revenue:{' '}
           {formatBalance(before.lifetime_revenue)}{' '}
@@ -539,7 +690,8 @@ export function ManualCase({
           <div className="comparison-row changed" key={key} role="row">
             <span role="rowheader">{labels[key] ?? key}</span>
             <span role="cell">{String(before[key] ?? '—')}</span>
-            <span role="cell">{String(value)}</span>
+            <span role="cell">{relationshipTarget && ['chow_current_account', 'duplicate_of_account'].includes(key)
+              ? `${relationshipTarget.name} · ${String(value)}` : String(value)}</span>
           </div>
         ))}
       </div>

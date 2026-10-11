@@ -725,3 +725,215 @@ test('malformed manual recovery checkpoints stop before another CRM write', asyn
   assert.equal((await s.ledger.all('SELECT * FROM decisions')).length, 1);
   assert.equal((await s.ledger.all('SELECT * FROM locks')).length, 0);
 });
+
+function relationshipPair(s, type = 'chow') {
+  const source = s.data.accounts.find((account) => account.name === 'Bellhaven of Sandusky');
+  const target = s.data.accounts.find((account) => account.name === 'Millstone Care of Sandusky');
+  assert(source && target);
+  if (type === 'duplicate') {
+    source.parent_id = target.parent_id;
+    source.lifetime_revenue = 0;
+    source.outstanding_ar = 0;
+  }
+  return { source, target, draft: () => stageManual(s.ledger, s.client, {
+    entity: 'accounts', recordId: source.account_id, fields: {},
+    relationship: { type, target_id: target.account_id },
+    note: 'Operator confirmed the ownership or duplicate relationship with the account owner.',
+  }, identity) };
+}
+
+test('existing successor CHOW changes only the original pointer and preserves billed successor and contacts', async (t) => {
+  const s = setup();
+  t.after(() => s.sqlite.close());
+  const pair = relationshipPair(s);
+  pair.target.lifetime_revenue = 5400;
+  pair.target.outstanding_ar = 180;
+  const original = clone(pair.source), target = clone(pair.target), contacts = clone(s.data.contacts);
+  const p = await pair.draft();
+  assert.equal(p.type, 'patch');
+  assert.deepEqual(p.relationship, { type: 'chow', target_id: target.account_id });
+  assert.equal(p.dependencies[0].account_id, target.account_id);
+  assert.equal(s.writes.length, 0);
+  await decideManual(s.ledger, s.client, input(p), identity);
+  assert.deepEqual(pair.source, { ...original, chow_current_account: target.account_id });
+  assert.deepEqual(pair.target, target);
+  assert.deepEqual(s.data.contacts, contacts);
+  assert.deepEqual(s.writes, [{ method: 'PATCH', entity: 'accounts', id: original.account_id,
+    fields: { chow_current_account: target.account_id } }]);
+  await assert.rejects(decideManual(s.ledger, s.client, input(p), identity), /available/);
+  assert.equal(s.writes.length, 1);
+});
+
+test('explicit duplicate approval retires only the zero-balance source and preserves target and contacts', async (t) => {
+  const s = setup();
+  t.after(() => s.sqlite.close());
+  const pair = relationshipPair(s, 'duplicate');
+  pair.target.lifetime_revenue = 64000;
+  const original = clone(pair.source), target = clone(pair.target), contacts = clone(s.data.contacts);
+  const p = await pair.draft();
+  await decideManual(s.ledger, s.client, input(p), identity);
+  assert.deepEqual(pair.source, { ...original, status: 'Inactive', duplicate_of_account: target.account_id });
+  assert.deepEqual(pair.target, target);
+  assert.deepEqual(s.data.contacts, contacts);
+  assert.equal(s.writes.length, 1);
+});
+
+test('manual relationship rejects stale source, successor, or either parent before approval', async (t) => {
+  for (const changed of ['source', 'target', 'source-parent', 'target-parent']) {
+    const s = setup();
+    t.after(() => s.sqlite.close());
+    const pair = relationshipPair(s), p = await pair.draft();
+    const account = changed.endsWith('parent')
+      ? s.data.accounts.find((account) => account.account_id === pair[changed.split('-')[0]].parent_id)
+      : pair[changed];
+    account.note = 'External change';
+    await assert.rejects(decideManual(s.ledger, s.client, input(p), identity), /changed/);
+    assert.equal(s.writes.length, 0);
+    assert.equal((await s.ledger.one('SELECT status FROM proposals WHERE id=?', p.id)).status, 'stale');
+  }
+});
+
+test('relationship safeguards reject unsupported billing, identity, parent and historical cases', async (t) => {
+  const cases = [
+    ['duplicate', (s, p) => { p.source.parent_id = s.data.accounts.find((a) => a.name === 'Bellhaven Senior Living (Parent Account)').account_id; }, /same parent/],
+    ['duplicate', (_, p) => { p.source.lifetime_revenue = 1; }, /verified zero/],
+    ['duplicate', (_, p) => { p.source.outstanding_ar = -1; }, /verified zero/],
+    ['duplicate', (_, p) => { p.source.outstanding_ar = null; }, /verified zero/],
+    ['duplicate', (s, p) => { s.data.accounts[0].chow_current_account = p.source.account_id; }, /receives historical/],
+    ['chow', (_, p) => { p.source.outstanding_ar = 0; }, /requires positive/],
+    ['chow', (_, p) => { p.source.lifetime_revenue = null; }, /Billing fields/],
+    ['chow', (_, p) => { p.target.parent_id = p.source.parent_id; }, /different parent/],
+    ['chow', (_, p) => { p.source.parent_id = ''; }, /explicit parent/],
+    ['chow', (_, p) => { p.source.chow_current_account = p.target.account_id; }, /Historical/],
+    ['chow', (_, p) => { p.target.chow_current_account = p.source.account_id; }, /Historical/],
+    ['chow', (_, p) => { p.target.status = 'Needs Review'; }, /active current target/],
+    ['chow', (_, p) => { p.target.lifetime_revenue = '9'.repeat(400); }, /verified billing/],
+    ['chow', (_, p) => { p.target.outstanding_ar = null; }, /verified billing/],
+    ['chow', (_, p) => { p.target.lifetime_revenue = -1; }, /verified billing/],
+    ['chow', (_, p) => { p.target.billing_street = '2716 Columbus Ave'; }, /physical street/],
+    ['chow', (_, p) => { p.target.billing_city = 'Toledo'; }, /physical street/],
+    ['chow', (_, p) => { p.target.billing_zip = '00000'; }, /physical street/],
+    ['chow', (_, p) => { p.source.billing_zip = ''; }, /physical street/],
+    ['chow', (_, p) => { p.source.billing_street = p.target.billing_street = 'PO Box 30'; }, /physical street/],
+    ['chow', (_, p) => { p.source.name += ' (Parent Account)'; }, /Parent accounts/],
+    ['chow', (s, p) => { s.data.accounts[0].parent_id = p.target.account_id; }, /Parent accounts/],
+    ['chow', (s, p) => { s.data.accounts.find((a) => a.account_id === p.target.parent_id).parent_id = p.source.account_id; }, /cycle|invalid|Parent accounts/],
+  ];
+  for (const [type, change, expected] of cases) {
+    const s = setup();
+    t.after(() => s.sqlite.close());
+    const pair = relationshipPair(s, type);
+    change(s, pair);
+    await assert.rejects(pair.draft(), expected);
+    assert.equal(s.writes.length, 0);
+  }
+});
+
+test('relationship requests refuse self-links, arbitrary patches, unknown fields and contacts', async (t) => {
+  const s = setup();
+  t.after(() => s.sqlite.close());
+  const { source, target } = relationshipPair(s);
+  const draft = { entity: 'accounts', recordId: source.account_id, fields: {}, note: 'Confirmed successor.',
+    relationship: { type: 'chow', target_id: target.account_id } };
+  for (const input of [
+    { ...draft, relationship: { ...draft.relationship, target_id: source.account_id } },
+    { ...draft, fields: { parent_id: target.parent_id } },
+    { ...draft, relationship: { ...draft.relationship, bypass: true } },
+    { ...draft, entity: 'contacts' },
+    { ...draft, recordId: undefined },
+  ]) await assert.rejects(stageManual(s.ledger, s.client, input, identity), /different target|requires an existing/);
+  assert.equal(s.writes.length, 0);
+});
+
+test('relationship versions bind the chosen target, fields and evidence', async (t) => {
+  for (const altered of ['relationship', 'fields', 'dependencies']) {
+    const s = setup();
+    t.after(() => s.sqlite.close());
+    const pair = relationshipPair(s), p = await pair.draft();
+    const stored = JSON.parse((await s.ledger.one('SELECT data FROM proposals WHERE id=?', p.id)).data);
+    if (altered === 'relationship') stored.relationship.target_id = pair.source.account_id;
+    else if (altered === 'dependencies') stored.dependencies[0].phone = '555-0000';
+    else {
+      stored.fields.note = 'Should not change';
+      stored.options[0].operations[0].fields.note = stored.fields.note;
+    }
+    await s.ledger.run('UPDATE proposals SET data=? WHERE id=?', JSON.stringify(stored), p.id);
+    await assert.rejects(decideManual(s.ledger, s.client, input(p), identity), /integrity/);
+    assert.equal(s.writes.length, 0);
+  }
+});
+
+test('relationship lost write response reads back success; interrupted link resumes after ledger restart without duplicate writes', async (t) => {
+  for (const type of ['chow', 'duplicate']) {
+    const s = setup();
+    t.after(() => s.sqlite.close());
+    const pair = relationshipPair(s, type), p = await pair.draft();
+    const patch = s.client.patch;
+    s.client.patch = async (...args) => { await patch(...args); throw Error('Response lost'); };
+    s.sqlite.exec("CREATE TRIGGER fail_verification BEFORE INSERT ON audits WHEN NEW.event='operation_verified' BEGIN SELECT RAISE(ABORT,'temporary audit failure'); END");
+    await assert.rejects(decideManual(s.ledger, s.client, input(p), identity), /temporary audit failure/);
+    assert.equal(s.writes.length, 1);
+    assert.equal((await s.ledger.one('SELECT status FROM proposals WHERE id=?', p.id)).status, 'partial');
+    s.sqlite.exec('DROP TRIGGER fail_verification');
+    s.ledger = new Ledger(sqliteD1(s.sqlite));
+    await decideManual(s.ledger, s.client, input(p, 'resume'), identity);
+    assert.equal(s.writes.length, 1);
+    assert.equal((await s.ledger.one('SELECT status FROM proposals WHERE id=?', p.id)).status, 'applied');
+  }
+});
+
+test('interrupted relationship locks target edits and refuses changed target on resume', async (t) => {
+  const s = setup();
+  t.after(() => s.sqlite.close());
+  const pair = relationshipPair(s), p = await pair.draft();
+  s.failLink(true);
+  await assert.rejects(decideManual(s.ledger, s.client, input(p), identity), /Patch not verified/);
+  const writes = s.writes.length;
+  await assert.rejects(stage(s, 'accounts', pair.target.account_id, { phone: '555-5555' }), /interrupted approved/);
+  await assert.rejects(stage(s, 'accounts', pair.target.parent_id, { phone: '555-5555' }), /interrupted approved/);
+  pair.target.phone = '555-9999';
+  s.failLink(false);
+  await assert.rejects(decideManual(s.ledger, s.client, input(p, 'resume'), identity), /changed/);
+  assert.equal(s.writes.length, writes);
+});
+
+test('concurrent relationship approvals perform one source write', async (t) => {
+  const s = setup();
+  t.after(() => s.sqlite.close());
+  const pair = relationshipPair(s), p = await pair.draft();
+  const results = await Promise.allSettled([decideManual(s.ledger, s.client, input(p), identity),
+    decideManual(s.ledger, s.client, input(p), identity)]);
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+  assert.equal(s.writes.length, 1);
+});
+
+test('existing CHOW chains can extend without changing prior historical accounts', async (t) => {
+  const s = setup();
+  t.after(() => s.sqlite.close());
+  const pair = relationshipPair(s);
+  const prior = { ...clone(pair.source), account_id: 'earlier-owner', name: 'Earlier owner facility',
+    chow_current_account: pair.source.account_id };
+  s.data.accounts.push(prior);
+  const before = clone(prior), p = await pair.draft();
+  await decideManual(s.ledger, s.client, input(p), identity);
+  assert.deepEqual(prior, before);
+  assert.equal(pair.source.chow_current_account, pair.target.account_id);
+  assert.equal(s.writes.length, 1);
+});
+
+test('relationship target must agree with its requested ID and appear once in the complete inventory', async (t) => {
+  for (const mode of ['wrong-get', 'missing-list', 'duplicate-list', 'wrong-parent']) {
+    const s = setup();
+    t.after(() => s.sqlite.close());
+    const pair = relationshipPair(s), get = s.client.get, accounts = s.client.accounts;
+    if (mode === 'wrong-get') s.client.get = async (id) => id === pair.target.account_id
+      ? { ...await get(id), account_id: 'wrong-account' } : get(id);
+    else if (mode === 'wrong-parent') s.client.get = async (id) => id === pair.target.parent_id
+      ? { ...await get(id), account_id: 'wrong-parent' } : get(id);
+    else s.client.accounts = async () => mode === 'missing-list'
+      ? (await accounts()).filter((a) => a.account_id !== pair.target.account_id)
+      : [...await accounts(), clone(pair.target)];
+    await assert.rejects(pair.draft(), /does not match|exactly once|differs from the requested ID/);
+    assert.equal(s.writes.length, 0);
+  }
+});

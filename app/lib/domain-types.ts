@@ -132,6 +132,7 @@ export interface SignalCandidate extends Candidate {
 export type Operation =
   | { type: 'create'; fields: AccountPatch; before?: never; account_id?: never }
   | { type: 'chow'; account_id: string; before: Account; fields: AccountPatch }
+  | { type: 'chow_link'; account_id: string; before: Account; fields: AccountPatch & { chow_current_account: string }; dependencies: Account[] }
   | { type: 'patch'; account_id: string; before: Account; fields: AccountPatch }
   | { type: 'duplicate'; account_id: string; before: Account; fields: AccountPatch };
 

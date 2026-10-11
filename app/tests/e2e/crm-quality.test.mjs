@@ -151,6 +151,53 @@ test('CRM quality: acknowledgment and rejection survive restart and repeat refre
   assert.equal(hosted.writes.length, 0);
 });
 
+test('CRM quality: a saved no-write review reopens through the public/local API and stays pending until a fresh decision', async (t) => {
+  const { hosted, local } = await setup(t);
+  hosted.data.accounts.push(parent('other-parent'));
+  const rows = [account('follow-up-a', { lifetime_revenue: 130000, outstanding_ar: 5200 }),
+    account('follow-up-b', { parent_id: PREFIX + 'other-parent', parent_name: 'Test other-parent (Parent Account)' })];
+  hosted.data.accounts.push(...rows);
+  const before = structuredClone(hosted.data);
+  ok(await hosted.pipeline());
+  const proposal = qualityCase(await read(local), 'account_overlap', 'follow-up-a');
+  const acknowledge = proposal.options.find((option) => option.id === 'acknowledge');
+  const flag = proposal.options.find((option) => option.id === 'flag');
+  ok(await decide(local, proposal, acknowledge));
+  assert.equal((await decide(hosted, proposal, acknowledge, 'reopen', '')).status, 409);
+  assert.equal((await decide(local, proposal, flag, 'reopen')).status, 409, 'An unapproved client choice cannot authorize reopening');
+  assert.equal(ok(await decide(hosted, proposal, undefined, 'reopen', 'Keep the possible ownership relationship open until the account owner confirms it.')).status, 'pending');
+  assert.equal((await decide(local, proposal, acknowledge, 'reopen')).status, 409, 'Repeated clicks cannot record another reopening');
+  await hosted.restart();
+  await local.restart();
+  for (let pass = 0; pass < 2; pass++) {
+    assert.equal(ok(await hosted.pipeline()).new_proposals, 0);
+    const state = await read(local);
+    const current = qualityCase(state, 'account_overlap', 'follow-up-a');
+    assert.equal(current.id, proposal.id);
+    assert.equal(current.status, 'pending');
+    assert.deepEqual(state.decisions.filter((d) => d.proposal_id === proposal.id).map((d) => d.action), ['reopen', 'approve']);
+    assert.equal(state.audits.filter((a) => a.proposal_id === proposal.id && a.event === 'case_reopened').length, 1);
+    assert.equal((await read(local, 'report')).recovery.case_count, 0);
+  }
+  assert.equal(hosted.writes.length, 0);
+  assert.deepEqual(hosted.data, before, 'Reopening changes the review ledger only');
+  assert.equal((await hosted.db.prepare('SELECT COUNT(*) AS n FROM operations WHERE proposal_id=?').bind(proposal.id).first()).n, 0);
+  ok(await decide(local, proposal, flag));
+  assert.equal(hosted.writes.length, 2);
+  assert(rows.every((row) => row.status === 'Needs Review'));
+  for (const row of rows) {
+    const original = before.accounts.find((a) => a.account_id === row.account_id);
+    assert.deepEqual({ ...row, note: original.note, status: original.status }, original);
+  }
+  const saved = await read(hosted);
+  assert.equal(saved.decisions.find((d) => d.proposal_id === proposal.id && d.action === 'approve').option_id, flag.id);
+  assert.equal((await read(local, 'report')).history.verified_applied_cases, 1);
+  assert.equal((await decide(local, proposal, acknowledge, 'reopen')).status, 409, 'A former no-write option cannot undo the later actual-write approval');
+  assert.equal(ok(await hosted.pipeline()).new_proposals, 0);
+  assert.equal((await read(local)).proposals.find((p) => p.id === proposal.id).status, 'applied');
+  assert.equal(hosted.writes.length, 2);
+});
+
 test('CRM quality: approved unrelated duplicates retire only empty copies and preserve survivor history', async (t) => {
   const { hosted, local } = await setup(t);
   const rows = seedDuplicates(hosted);
@@ -286,6 +333,35 @@ test('CRM quality: shared-address different-parent accounts can be flagged but n
   assert(!state.proposals.some((row) => row.key === p.key && row.status === 'pending'));
   assert.equal(state.proposals.find((row) => row.id === p.id).status, 'applied');
   assert.equal(hosted.writes.length, 2);
+});
+
+test('CRM quality: daily discovery offers a guarded existing-successor CHOW choice with approval-only linking', async (t) => {
+  const { hosted, local } = await setup(t);
+  hosted.data.accounts.push(parent('other-parent'));
+  const old = account('chow-old', { lifetime_revenue: 130000, outstanding_ar: 5200, status: 'Needs Review' });
+  const next = account('chow-next', { name: 'New Operator Manor', parent_id: PREFIX + 'other-parent' });
+  hosted.data.accounts.push(old, next);
+  const before = structuredClone(hosted.data);
+  ok(await hosted.pipeline());
+  const p = qualityCase(await read(local), 'account_overlap', 'chow-old');
+  const choice = p.options.find((o) => o.operations.some((op) => op.type === 'chow_link'));
+  assert(choice);
+  assert.match(choice.label, /If ownership is confirmed/);
+  assert.deepEqual(choice.operations.map((op) => ({ type: op.type, account_id: op.account_id, fields: op.fields })),
+    [{ type: 'chow_link', account_id: old.account_id, fields: { chow_current_account: next.account_id } }]);
+  assert.equal(hosted.writes.length, 0);
+  assert.equal((await decide(local, p, choice, 'approve', '')).status, 409);
+  ok(await decide(local, p, choice, 'approve', 'The account owner confirmed the new operator and existing successor account. Preserve the old billing record.'));
+  assert.equal(hosted.writes.length, 1);
+  assert.deepEqual(hosted.data, { ...before, accounts: before.accounts.map((a) => a.account_id === old.account_id ? { ...a, chow_current_account: next.account_id } : a) });
+  assert.equal((await decide(hosted, p, choice, 'reopen')).status, 409);
+  await hosted.restart();
+  await local.restart();
+  for (let pass = 0; pass < 2; pass++) assert.equal(ok(await hosted.pipeline()).new_proposals, 0);
+  const state = await read(local);
+  assert(!state.proposals.some((row) => row.key === p.key && row.status === 'pending'));
+  assert.equal((await read(local, 'report')).history.verified_applied_cases, 1);
+  assert.equal(hosted.writes.length, 1);
 });
 
 test('CRM quality: billing, history and contact exceptions cannot offer unsupported consolidation', async (t) => {

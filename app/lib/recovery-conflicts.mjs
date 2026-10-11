@@ -59,7 +59,11 @@ function footprint(proposal, options, checkpoints = []) {
     record(entity, operation.record_id ?? operation.account_id);
     values(entity, operation.before);
     values(entity, { ...operation.before, ...operation.fields });
+    if (operation.type === 'chow_link')
+      for (const dependency of operation.dependencies) reference(dependency.account_id);
   }
+  if (proposal.manual && proposal.relationship)
+    for (const dependency of proposal.dependencies ?? []) reference(dependency.account_id);
   for (const checkpoint of checkpoints) {
     const operation = operations[checkpoint.step],
       entity = operation?.entity ?? proposal.entity ?? 'accounts';

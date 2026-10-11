@@ -33,6 +33,9 @@ export default function QualityCase({
   const historical = proposal.status !== 'pending';
   const savedPlan = ['applied', 'applying', 'partial'].includes(proposal.status);
   const noWrites = !!option && option.operations.length === 0 && !!option.field_choices;
+  const linksSuccessor = !!option?.operations.some((operation) => Object.hasOwn(operation.fields, 'chow_current_account'));
+  const reopening = ['stale', 'rejected'].includes(proposal.status) || (proposal.status === 'applied' && noWrites);
+  const noteRequired = proposal.status === 'pending' || reopening;
   const accounts = [...new Map([...proposal.candidates, ...proposal.alternatives]
     .map((candidate) => [candidate.account.account_id, candidate.account])).values()];
   const contacts = quality?.contacts ?? [];
@@ -115,6 +118,7 @@ export default function QualityCase({
 
       <section className="quality-preview" aria-label="Selected resolution changes" aria-live="polite">
         <h3>{savedPlan ? noWrites ? 'Saved review' : 'Approved changes' : historical ? 'Saved proposed changes' : 'Changes in this choice'}</h3>
+        {linksSuccessor && <p className="evidence-foot">Links to the existing successor. Both parents, billing balances, other business fields, and contacts stay unchanged. No new account is created.</p>}
         {!option ? <p>{proposal.status === 'rejected' ? 'This proposal was rejected. No CRM changes were approved.' : 'Select a resolution to preview it.'}</p>
           : noWrites ? <p>{proposal.status === 'applied' ? 'Review recorded. No CRM fields changed.' : 'Records this review without changing any CRM fields.'} The same finding stays closed on reruns unless its evidence changes. This does not confirm an unresolved fact has been corrected.</p>
           : option.operations.map((operation, index) => <div key={`${operation.account_id || 'new'}-${index}`} className="quality-operation">
@@ -132,18 +136,18 @@ export default function QualityCase({
       <div className="decision-panel">
         <div className="decision-context"><h3>{['applied', 'rejected'].includes(proposal.status) ? 'Decision saved' : ['partial', 'applying'].includes(proposal.status) ? 'Finish approved work' : 'Your decision'}</h3></div>
         {decisions.filter((item) => item.proposal_id === proposal.id).map((item) => <p key={item.id} className="saved-decision"><strong>{item.action}</strong> · {date(item.created)} · {item.actor}<br />{item.note || 'No additional reviewer note.'}</p>)}
-        {proposal.status !== 'applied' && <>
-          <label htmlFor="quality-reviewer-note">Reviewer note{['pending', 'stale', 'rejected'].includes(proposal.status) ? ' (required)' : ''}</label>
-          <textarea id="quality-reviewer-note" rows={3} maxLength={2000} value={note} required={['pending', 'stale', 'rejected'].includes(proposal.status)} aria-describedby="quality-decision-help" disabled={mutationBusy} onChange={(event) => setNote(event.target.value)} placeholder={['stale', 'rejected'].includes(proposal.status) ? 'Explain why this case should be reopened.' : ['partial', 'applying'].includes(proposal.status) ? 'Optional note for resuming the saved approval.' : 'Explain the evidence behind your decision.'} />
+        {(proposal.status !== 'applied' || reopening) && <>
+          <label htmlFor="quality-reviewer-note">Reviewer note{noteRequired ? ' (required)' : ''}</label>
+          <textarea id="quality-reviewer-note" rows={3} maxLength={2000} value={note} required={noteRequired} aria-describedby="quality-decision-help" disabled={mutationBusy} onChange={(event) => setNote(event.target.value)} placeholder={reopening ? 'Explain what still needs verification.' : ['partial', 'applying'].includes(proposal.status) ? 'Optional note for resuming the saved approval.' : linksSuccessor ? 'Cite evidence confirming the ownership transfer and successor. A shared address alone is not enough.' : 'Explain the evidence behind your decision.'} />
           <div className="decision-actions">
             {proposal.status === 'pending' ? <>
               <button className="secondary" disabled={!!busy || !note.trim()} onClick={() => onDecision('reject')}>Reject proposal</button>
               <button className="primary" disabled={!!busy || !note.trim() || !option || (!option.operations.length && !option.field_choices)} onClick={() => onDecision('approve')}><Check size={16} />{noWrites ? 'Save review' : 'Approve and apply'}</button>
             </> : ['partial', 'applying'].includes(proposal.status) ? <button className="primary" disabled={!!busy || !option} onClick={() => onDecision('resume')}>Resume approved operation</button>
-              : ['stale', 'rejected'].includes(proposal.status) ? <button className="secondary" disabled={!!busy || !note.trim()} onClick={() => onDecision('reopen')}>Reopen for review</button> : null}
+              : reopening ? <button className="secondary" disabled={!!busy || !note.trim()} onClick={() => onDecision('reopen')}>Reopen for review</button> : null}
           </div>
           <p className="decision-foot" id="quality-decision-help">{['partial', 'applying'].includes(proposal.status) ? 'Resume checks completed steps and continues the saved approval.'
-            : ['stale', 'rejected'].includes(proposal.status) ? 'Reopening requires a reason and keeps the earlier decision in history.'
+            : reopening ? 'Returns this finding to the queue and keeps the earlier decision in history. No CRM fields change.'
             : !option ? 'Select a resolution and add a note to save this review, or reject it with a reason.'
             : !note.trim() ? 'Add a note explaining your decision before saving or applying this review.'
             : noWrites ? 'Saves this review to the decision ledger. No CRM API writes are included.'

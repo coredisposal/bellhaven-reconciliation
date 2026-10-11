@@ -21,17 +21,17 @@ export async function reviewState(db, mode, credentialValues = []) {
   // Bound general activity, but keep the decisions required to interpret every
   // visible case. An old approved survivor must never disappear after 500 events.
   const decisions = await db.all(`SELECT d.* FROM decisions d WHERE
-    d.id IN (SELECT id FROM decisions ORDER BY created DESC,id DESC LIMIT 500)
+    d.id IN (SELECT id FROM decisions ORDER BY rowid DESC LIMIT 500)
     OR d.id IN (SELECT (
       SELECT latest.id FROM decisions latest WHERE latest.proposal_id=p.id
-      ORDER BY latest.created DESC,latest.id DESC LIMIT 1
+      ORDER BY latest.rowid DESC LIMIT 1
     ) FROM proposals p WHERE p.status!='superseded')
     OR d.id IN (SELECT (
       SELECT approval.id FROM decisions approval
       WHERE approval.proposal_id=p.id AND approval.action='approve'
-      ORDER BY approval.created DESC,approval.id DESC LIMIT 1
+      ORDER BY approval.rowid DESC LIMIT 1
     ) FROM proposals p WHERE p.status IN ('applied','partial','applying'))
-    ORDER BY d.created DESC,d.id DESC`);
+    ORDER BY d.rowid DESC`);
   const audits = (await db.all('SELECT * FROM audits ORDER BY created DESC LIMIT 1000')).map(
     (row) => ({ ...row, data: JSON.parse(row.data) })
   );

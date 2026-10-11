@@ -2,6 +2,7 @@
 import { canonical, digest, businessAccount, needsChow, norm, streetKey } from './core.mjs';
 import { assertNoInterruptedOverlap } from './recovery-conflicts.mjs';
 import { isRecord, isAccount, isContact } from './contracts.mjs';
+import { assertRelationship } from './account-relationships.mjs';
 
 /** @typedef {import('./domain-types').Account} Account */
 /** @typedef {import('./domain-types').Contact} Contact */
@@ -9,6 +10,7 @@ import { isRecord, isAccount, isContact } from './contracts.mjs';
 /** @typedef {Account & Partial<Contact>} ManualRecord */
 /** @typedef {'accounts' | 'contacts'} Entity */
 /** @typedef {'patch' | 'create' | 'chow'} ManualType */
+/** @typedef {{type:'chow'|'duplicate', target_id:string}} ManualRelationship */
 /** @typedef {{actor: string, session: string}} Identity */
 /** @typedef {import('./ledger.mjs').Ledger} Ledger */
 /** @typedef {import('./execution-types').CrmClient} CrmClient */
@@ -16,9 +18,9 @@ import { isRecord, isAccount, isContact } from './contracts.mjs';
 /** @typedef {{get:(id:string)=>Promise<ManualRecord>, all:()=>Promise<ManualRecord[]>, patch:(id:string,fields:ManualFields)=>Promise<unknown>, create:(fields:ManualFields)=>Promise<CreatedIdentity | {data:CreatedIdentity}>, id:'account_id'|'contact_id'}} ManualAdapter */
 /** @typedef {{type:ManualType, entity:Entity, record_id?:string, account_id?:string, before:ManualRecord|null, fields:ManualFields}} ManualOperation */
 /** @typedef {{id:string, label:string, operations:ManualOperation[]}} ManualOption */
-/** @typedef {{id:string, version:string, key:string, manual:true, origin:'manual', entity:Entity, kind:'manual_account'|'manual_contact', type:ManualType, title:string, city:string, state:string, summary:string, before:ManualRecord|null, fields:ManualFields, proposed:ManualFields, recordId:string|null, reviewer_note:string, dependencies:Account[], marker:string|null, create_identity:string|null, facility:null, candidates:{account:ManualRecord, contacts:Contact[], reasons:string[], conflicts:string[]}[], alternatives:never[], options:ManualOption[], material:unknown, evidence_version?:string, revision_of?:string}} ManualProposal */
+/** @typedef {{id:string, version:string, key:string, manual:true, origin:'manual', entity:Entity, kind:'manual_account'|'manual_contact', type:ManualType, title:string, city:string, state:string, summary:string, before:ManualRecord|null, fields:ManualFields, proposed:ManualFields, recordId:string|null, reviewer_note:string, dependencies:Account[], relationship?:ManualRelationship, marker:string|null, create_identity:string|null, facility:null, candidates:{account:ManualRecord, contacts:Contact[], reasons:string[], conflicts:string[]}[], alternatives:never[], options:ManualOption[], material:unknown, evidence_version?:string, revision_of?:string}} ManualProposal */
 /** @typedef {{recordId?:string, created?:ManualRecord, before?:ManualRecord|null, fields?:ManualFields, marker?:string|null}} ManualCheckpoint */
-/** @typedef {Pick<ManualProposal,'id'|'key'|'version'|'manual'|'origin'|'entity'|'type'|'before'|'fields'|'recordId'|'dependencies'|'marker'|'create_identity'|'options'|'material'|'reviewer_note'|'evidence_version'|'revision_of'>} ManualExecutionProposal */
+/** @typedef {Pick<ManualProposal,'id'|'key'|'version'|'manual'|'origin'|'entity'|'type'|'before'|'fields'|'recordId'|'dependencies'|'relationship'|'marker'|'create_identity'|'options'|'material'|'reviewer_note'|'evidence_version'|'revision_of'>} ManualExecutionProposal */
 /** @typedef {'create_intent'|'created_response'|'created'|'link_intent'|'patch_intent'|'complete'} ManualCheckpointStatus */
 
 /** @type {(keyof import('./domain-types').AccountPatch)[]} */
@@ -44,7 +46,7 @@ const isManualRecord = (value, entity) => entity === 'accounts' ? isAccount(valu
 function isStoredFields(value, entity) {
   if (!isRecord(value)) return false;
   const allowed = entity === 'accounts'
-    ? [...ACCOUNT_FIELDS, 'lifetime_revenue', 'outstanding_ar', 'chow_current_account']
+    ? [...ACCOUNT_FIELDS, 'lifetime_revenue', 'outstanding_ar', 'chow_current_account', 'duplicate_of_account']
     : CONTACT_FIELDS;
   return Object.entries(value).every(([key, item]) => allowed.includes(key) &&
     (key === 'is_active' ? typeof item === 'boolean'
@@ -67,6 +69,7 @@ function isStoredProposal(value) {
   const entity = value.entity;
   return ['id', 'key', 'version'].every((key) => typeof value[key] === 'string' && !!value[key]) &&
     typeof value.reviewer_note === 'string' &&
+    (value.relationship === undefined || (entity === 'accounts' && value.type === 'patch' && isRelationship(value.relationship))) &&
     ['evidence_version', 'revision_of'].every((key) => value[key] === undefined ||
       (typeof value[key] === 'string' && !!value[key])) &&
     (value.type === 'create' || value.type === 'patch' || (entity === 'accounts' && value.type === 'chow')) &&
@@ -184,6 +187,57 @@ function identityKey(entity, a) {
       ]);
 }
 
+/** @param {unknown} value @returns {value is ManualRelationship} */
+function isRelationship(value) {
+  return isRecord(value) && Object.keys(value).length === 2 &&
+    (value.type === 'chow' || value.type === 'duplicate') &&
+    typeof value.target_id === 'string' && !!value.target_id.trim() && value.target_id.length <= 100 &&
+    !/[\u0000-\u001f\u007f]/.test(value.target_id);
+}
+/** Only the server derives protected relationship patches.
+ * @param {ManualRelationship} relationship @returns {ManualFields}
+ */
+function relationshipFields(relationship) {
+  return relationship.type === 'chow'
+    ? { chow_current_account: relationship.target_id }
+    : { status: 'Inactive', duplicate_of_account: relationship.target_id };
+}
+/** An address establishes physical overlap, not ownership. The reviewer's
+ * required confirmation note supplies the basis for the selected relationship.
+ * @param {CrmClient} client @param {Account} source @param {ManualRelationship} relationship
+ * @returns {Promise<Account[]>}
+ */
+async function relationshipDependencies(client, source, relationship) {
+  const target = await client.get(relationship.target_id);
+  if (!target || target.account_id !== relationship.target_id)
+    throw new Error('The selected target does not match the CRM response.');
+  assertRelationship(source, target, await client.accounts(), relationship.type);
+  const refs = [target];
+  for (const account of [source, target]) {
+    const parents = await dependencies(client, 'accounts', { parent_id: account.parent_id ?? '' }, account);
+    if (parents.some((parent) => parent.account_id === source.account_id || parent.account_id === target.account_id || parent.status !== 'Active'))
+      throw new Error('The facility parent relationship is invalid, cyclic or not active.');
+    refs.push(...parents);
+  }
+  return [...new Map(refs.map((account) => [account.account_id, account])).values()];
+}
+
+/** Recheck the relationship at each write boundary and on resume. A completed
+ * source patch is permitted only as the exact after-image of this approval.
+ * @param {CrmClient} client @param {ManualExecutionProposal} p
+ */
+async function verifyRelationship(client, p) {
+  if (!p.relationship) return;
+  if (!p.before || !p.recordId || !same(p.fields, relationshipFields(p.relationship)))
+    throw new Error('Stored relationship fields are invalid. Stage a fresh proposal.');
+  const current = await client.get(p.recordId);
+  if (!recordSame(current, p.before) && !recordSame(current, { ...p.before, ...p.fields }))
+    throw new Error('Relationship source changed. Stage a fresh proposal before approving.');
+  const refs = await relationshipDependencies(client, p.before, p.relationship);
+  if (!same(refs.map(clean), p.dependencies.map(clean)))
+    throw new Error('Linked account or parent changed. Stage a fresh proposal before approving.');
+}
+
 /** Stored JSON must still describe the exact draft bound to the displayed
  * version. Shape checks alone cannot catch an added, otherwise valid field.
  * @param {ManualExecutionProposal} p
@@ -197,7 +251,8 @@ async function verifyDraftIntegrity(p) {
   const expectedKey = `manual:${p.entity}:${p.recordId ?? (await digest({ entity: p.entity, identity: identityKey(p.entity, p.fields) }))}`;
   if (p.marker !== expectedMarker || p.key !== expectedKey ||
     p.create_identity !== (p.type === 'patch' ? null : identityKey(p.entity, p.fields)) ||
-    !same(material, { seed: material.seed, key: p.key, entity: p.entity, type: p.type, fields: p.fields, marker: p.marker }))
+    !same(material, { seed: material.seed, key: p.key, entity: p.entity, type: p.type, fields: p.fields, marker: p.marker,
+      ...(p.relationship ? { relationship: p.relationship } : {}) }))
     throw new Error('Stored manual proposal integrity check failed. Stage a fresh proposal.');
 
   // The marker was appended after the seed was computed. Older saved drafts
@@ -219,6 +274,7 @@ async function verifyDraftIntegrity(p) {
     rule: 'manual-v1', entity: p.entity, recordId: p.recordId,
     before: p.before ? clean(p.before) : null, fields,
     dependencies: p.dependencies.map(clean), reviewer_note: p.reviewer_note,
+    ...(p.relationship ? { relationship: p.relationship } : {}),
   })));
   const evidenceVersion = await digest(material);
   const expectedVersion = p.revision_of && p.type === 'patch'
@@ -235,6 +291,9 @@ async function verifyDraftIntegrity(p) {
  * @param {ManualExecutionProposal} p @param {ManualRecord} current
  */
 function verifyDirectParentPatch(p, current) {
+  if (p.entity === 'accounts' && p.type === 'patch' && !p.relationship &&
+    Object.keys(p.fields).some((field) => !ACCOUNT_FIELDS.includes(/** @type {keyof import('./domain-types').AccountPatch} */ (field))))
+    throw new Error('Protected relationship and billing fields require a dedicated reviewed operation.');
   if (p.entity === 'accounts' && p.type === 'patch' && Object.hasOwn(p.fields, 'parent_id') &&
     needsChow(current, p.fields.parent_id))
     throw new Error('Revenue history and outstanding AR require CHOW. A direct parent patch is not allowed. Stage a fresh proposal.');
@@ -253,7 +312,7 @@ async function dependencies(client, entity, fields, before) {
     if (seen.has(cursor)) throw new Error('The proposed parent relationship forms a cycle.');
     seen.add(cursor);
     const account = await client.get(cursor);
-    if (!account?.account_id) throw new Error('The linked account does not exist.');
+    if (!account?.account_id || account.account_id !== cursor) throw new Error('The linked account does not exist or differs from the requested ID.');
     if (
       account.status === 'Inactive' ||
       account.duplicate_of_account ||
@@ -301,7 +360,7 @@ async function duplicateCreate(api, p, knownId) {
 export async function stageManual(ledger, client, input, identity) {
   if (!input || (input.entity !== 'accounts' && input.entity !== 'contacts'))
     throw new Error('Choose accounts or contacts.');
-  if (Object.keys(input).some((k) => !['entity', 'recordId', 'fields', 'note'].includes(k)))
+  if (Object.keys(input).some((k) => !['entity', 'recordId', 'fields', 'note', 'relationship'].includes(k)))
     throw new Error('Unexpected manual draft field.');
   const { entity, recordId } = input;
   if (
@@ -311,6 +370,11 @@ export async function stageManual(ledger, client, input, identity) {
     throw new Error('Invalid record ID.');
   if (typeof input.note !== 'string' || !input.note.trim() || input.note.length > 2000)
     throw new Error('Explain the purpose of this manual change (up to 2,000 characters).');
+  if (input.relationship !== undefined &&
+    (entity !== 'accounts' || !recordId || !isRelationship(input.relationship) ||
+      !isRecord(input.fields) || Object.keys(input.fields).length !== 0))
+    throw new Error('A relationship proposal requires an existing account, a supported target relationship and no additional fields.');
+  const relationship = /** @type {ManualRelationship|undefined} */ (input.relationship);
   const lock = crypto.randomUUID();
   await ledger.lock(lock);
   try {
@@ -323,7 +387,7 @@ export async function stageManual(ledger, client, input, identity) {
       (before.chow_current_account || before.duplicate_of_account)
     )
       throw new Error('Historical accounts are protected. Review the current account instead.');
-    const requested = validFields(entity, input.fields, !recordId);
+    const requested = relationship ? relationshipFields(relationship) : validFields(entity, input.fields, !recordId);
     /** @type {ManualFields} */
     let fields = Object.fromEntries(
       Object.entries(requested).filter(([key, value]) => !before || !same(readField(before, key), value))
@@ -331,8 +395,10 @@ export async function stageManual(ledger, client, input, identity) {
     if (!Object.keys(fields).length) throw new Error('These values already match the CRM.');
     /** @type {ManualType} */
     let type = recordId ? 'patch' : 'create';
-    const refs = await dependencies(client, entity, fields, before);
-    if (entity === 'accounts') {
+    const refs = relationship && before
+      ? await relationshipDependencies(client, before, relationship)
+      : await dependencies(client, entity, fields, before);
+    if (entity === 'accounts' && !relationship) {
       if (before) {
         const prior = [];
         if (Object.hasOwn(fields, 'name'))
@@ -364,11 +430,12 @@ export async function stageManual(ledger, client, input, identity) {
       fields,
       dependencies: refs.map(clean),
       reviewer_note: input.note,
+      ...(relationship ? { relationship } : {}),
     });
     const marker = entity === 'accounts' && type !== 'patch' ? `[bellhaven-manual:${seed}]` : null;
     if (marker) fields.note = [fields.note, marker].filter(Boolean).join('\n');
     const key = `manual:${entity}:${recordId ?? (await digest({ entity, identity: identityKey(entity, fields) }))}`;
-    const material = { seed, key, entity, type, fields, marker };
+    const material = { seed, key, entity, type, fields, marker, ...(relationship ? { relationship } : {}) };
     let version = await digest(material);
     /** @type {ManualOperation} */
     const operation = {
@@ -394,7 +461,11 @@ export async function stageManual(ledger, client, input, identity) {
       city: fields.billing_city ?? before?.billing_city ?? '',
       state: fields.billing_state ?? before?.billing_state ?? '',
       summary:
-        type === 'chow'
+        relationship?.type === 'chow'
+          ? `Link the original account to existing successor ${refs[0].name}. Preserve the original parent, billing and other fields; the successor stays unchanged.`
+          : relationship?.type === 'duplicate'
+          ? `Mark this zero-balance copy inactive and link it to ${refs[0].name}. Preserve both accounts' balances and contacts; the survivor stays unchanged.`
+          : type === 'chow'
           ? 'Manual parent change requires a zero-balance replacement; only the CHOW pointer will change on the original.'
           : 'Explicit manual API change. Review the stored fields and explanation before approval.',
       before,
@@ -403,6 +474,7 @@ export async function stageManual(ledger, client, input, identity) {
       recordId: recordId ?? null,
       reviewer_note: input.note,
       dependencies: refs,
+      ...(relationship ? { relationship } : {}),
       marker,
       create_identity: type !== 'patch' ? identityKey(entity, fields) : null,
       facility: null,
@@ -422,7 +494,11 @@ export async function stageManual(ledger, client, input, identity) {
         {
           id: 'manual',
           label:
-            type === 'chow'
+            relationship?.type === 'chow'
+              ? `Link to existing successor: ${refs[0].name}`
+              : relationship?.type === 'duplicate'
+              ? `Retire duplicate; keep ${refs[0].name}`
+              : type === 'chow'
               ? 'Create replacement and preserve original'
               : type === 'create'
                 ? 'Create record'
@@ -592,6 +668,7 @@ export async function decideManual(ledger, client, input, identity) {
     };
     try {
       await verifyDependencies(client, p);
+      await verifyRelationship(client, p);
       if (action === 'approve' && p.before && p.recordId) {
         const current = await api.get(p.recordId);
         if (!recordSame(current, p.before))
@@ -646,6 +723,7 @@ export async function decideManual(ledger, client, input, identity) {
           verifyDirectParentPatch(p, after);
           await save('patch_intent', { before: p.before, fields: p.fields });
           await ledger.fence(lock);
+          await verifyRelationship(client, p);
           try {
             await api.patch(p.recordId, p.fields);
           } catch {
@@ -655,6 +733,7 @@ export async function decideManual(ledger, client, input, identity) {
         }
         if (!recordSame(after, expected))
           throw new Error('Patch not verified. Resume rechecks before retrying.');
+        await verifyRelationship(client, p);
       } else {
         if (p.type === 'chow') {
           if (!p.recordId || !p.before) throw new Error('Stored CHOW has no original record.');

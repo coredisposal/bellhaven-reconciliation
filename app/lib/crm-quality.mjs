@@ -1,6 +1,7 @@
 // @ts-check
 /** Read-only checks across the complete CRM snapshot. Every write is an explicit option. */
 import { businessAccount, canonical, digest, facilityMaterial, norm, streetKey } from './core.mjs';
+import { assertRelationship } from './account-relationships.mjs';
 
 /** @typedef {import('./domain-types').Account} Account */
 /** @typedef {import('./domain-types').Contact} Contact */
@@ -97,7 +98,9 @@ export async function crmQuality(snapshot, facilityProposals = [], reviewedField
       accounts: affected.map(materialAccount), alternatives: alternatives.map(materialAccount),
       contacts: people.map(contactMaterial),
       facility: input.facility ? facilityMaterial(input.facility) : null,
-      options: options.map(({ id, field_choices, operations }) => ({ id, field_choices, operations: operations.map(({ before, ...operation }) => operation) })),
+      options: options.map(({ id, field_choices, operations }) => ({ id, field_choices, operations: operations.map(({ before, ...operation }) => ({
+        ...operation, ...(operation.type === 'chow_link' ? { dependencies: operation.dependencies.map(accountMaterial) } : {}),
+      })) })),
     };
     const version = await digest(material);
     result.push({
@@ -166,7 +169,38 @@ export async function crmQuality(snapshot, facilityProposals = [], reviewedField
       reason: `${billed.length ? 'Keep the account with billing history.' : contactBearing.length ? 'Keep the account with contacts.' : 'Evidence is equal; the stable account ID breaks the tie.'} Retired copies keep their original data and link to this survivor.`,
       operations: losers.map((a) => ({ type: 'duplicate', account_id: a.account_id, before: a, fields: { status: 'Inactive', duplicate_of_account: survivor.account_id } })),
     });
-    await add({ key, category: safeDuplicate ? 'duplicate' : 'account_overlap', title: `${group[0].billing_city}: ${group.length} accounts at one address`, detail, guidance: safeDuplicate ? 'Confirm the account IDs before consolidating. No balances or contacts move.' : 'Confirm facility identity and ownership before changing relationships. You can flag the accounts or retain them as separate records.', accounts: group, options });
+    // A same-address pair can offer a conditional successor link without
+    // asserting an acquisition. Require a clean, empty-history destination;
+    // the reviewer must independently confirm the ownership relationship.
+    if (!sameParent && group.length === 2 && group.every((a) => !protectedIds.has(a.account_id) && validParentChain(a))) {
+      for (const source of group) {
+        const target = group.find((a) => a.account_id !== source.account_id);
+        if (!target || !validBilling(target) || number(target.lifetime_revenue) !== 0 || number(target.outstanding_ar) !== 0) continue;
+        try { assertRelationship(source, target, accounts, 'chow'); } catch { continue; }
+        const dependencies = new Map([[target.account_id, target]]);
+        for (const account of [source, target]) {
+          let parentId = account.parent_id;
+          while (parentId) {
+            const parent = byId.get(parentId);
+            if (!parent || dependencies.has(parent.account_id)) break;
+            dependencies.set(parent.account_id, parent);
+            parentId = parent.parent_id;
+          }
+        }
+        if ([...dependencies.values()].some((a) => a.status !== 'Active')) continue;
+        options.unshift({
+          id: `chow-link:${source.account_id}:${target.account_id}`,
+          label: `If ownership is confirmed: link ${source.name} (${source.account_id}) to existing ${target.name} (${target.account_id})`,
+          reason: 'Set only the original account’s CHOW link. Preserve its parent, billing history and all other fields; reuse the existing successor without creating an account. Explain the evidence confirming ownership before approval.',
+          operations: [{ type: 'chow_link', account_id: source.account_id, before: source, fields: { chow_current_account: target.account_id }, dependencies: sortAccounts([...dependencies.values()]) }],
+        });
+      }
+    }
+    await add({ key, category: safeDuplicate ? 'duplicate' : 'account_overlap', title: `${group[0].billing_city}: ${group.length} accounts at one address`, detail, guidance: safeDuplicate
+      ? 'Confirm the account IDs before consolidating. No balances or contacts move.'
+      : options.some((option) => option.operations.some((operation) => operation.type === 'chow_link'))
+        ? 'If ownership is confirmed, link the original to the existing successor. Otherwise, flag the accounts for verification or keep them separate.'
+        : 'Confirm facility identity and ownership before changing relationships. You can flag the accounts or retain them as separate records.', accounts: group, options });
   }
 
   /** @type {Set<string>} */
