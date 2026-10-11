@@ -1,0 +1,248 @@
+.crm-search {
+  display: flex;
+  align-items: end;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 22px;
+}
+.crm-search label,
+.crm-fields label,
+.crm-reason {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.crm-query {
+  flex: 1;
+  min-width: 180px;
+}
+.crm-search input,
+.crm-search select,
+.crm-fields input,
+.crm-fields select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: white;
+  color: var(--ink);
+  min-height: 42px;
+}
+.crm-search button {
+  min-height: 42px;
+}
+.crm-filters {
+  margin: 16px 0 26px;
+  font-size: 13px;
+}
+.crm-filters .crm-fields {
+  padding-bottom: 18px;
+}
+.crm-columns {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(0, 2fr);
+  gap: 36px;
+}
+.crm-columns h3 {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+.crm-record-list {
+  max-height: 700px;
+  overflow-y: auto;
+  border-block: 1px solid var(--line);
+  scrollbar-width: thin;
+}
+.crm-record-list .case-row {
+  max-width: none;
+  min-width: 0;
+}
+.crm-record-id {
+  font-size: 11px;
+  color: var(--muted);
+}
+.crm-pagination {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+}
+.crm-pagination button {
+  font-size: 12px;
+}
+.crm-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin: 20px 0;
+}
+.crm-fields label:has(textarea) {
+  grid-column: 1/-1;
+}
+.crm-reason {
+  margin: 20px 0 16px;
+}
+.crm-billing {
+  font-size: 13px;
+  padding: 16px;
+  background: var(--green-soft);
+  border-radius: 7px;
+  margin-top: 18px;
+  color: #355941;
+}
+.crm-placeholder {
+  padding: 50px 0;
+  color: var(--muted);
+  max-width: 50ch;
+  font-size: 14px;
+}
+.manual-comparison-title {
+  margin: 26px 0 14px;
+}
+.crm-browser .section-heading {
+  flex-wrap: wrap;
+}
+.case-detail > .case-summary {
+  margin-top: 16px;
+  font-size: 14px;
+  color: var(--muted);
+}
+@media (max-width: 900px) {
+  .crm-columns {
+    grid-template-columns: 1fr;
+  }
+  .crm-record-list {
+    max-height: 280px;
+  }
+  .crm-fields {
+    gap: 12px;
+  }
+  .crm-browser .section-heading .secondary {
+    font-size: 12px;
+  }
+}
+@media (max-width: 760px) {
+  .crm-search input,
+  .crm-search select,
+  .crm-fields input,
+  .crm-fields select {
+    font-size: 16px;
+  }
+  .crm-fields {
+    grid-template-columns: 1fr;
+  }
+  .crm-query {
+    min-width: 100%;
+  }
+  .crm-search label:first-child {
+    min-width: 100%;
+  }
+  .crm-search button {
+    flex: 1;
+    font-size: 12px;
+  }
+  .crm-pagination button {
+    min-height: 42px;
+  }
+}
+
+.match-evidence {
+  margin: 24px 0;
+  padding: 0;
+  border-block: 1px solid var(--line);
+}
+.match-evidence p,
+.match-evidence dl {
+  font-size: 13px;
+  color: var(--muted);
+}
+.match-evidence dl {
+  margin: 14px 0 0;
+}
+.match-evidence dl > div {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 14px;
+  margin-top: 7px;
+}
+.match-evidence dd {
+  margin: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.manual-reason {
+  margin-top: 14px;
+  font-size: 14px;
+  white-space: pre-wrap;
+}
+@media (max-width: 760px) {
+  .match-evidence dl > div {
+    grid-template-columns: 1fr;
+    gap: 3px;
+  }
+}
+
+.activity-select {
+  margin: 18px 36px 0;
+}
+.activity-select label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.activity-select select {
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: white;
+  color: var(--ink);
+}
+.match-evidence > p:last-child {
+  padding-bottom: 16px;
+}
+.match-evidence summary,
+.candidate-section > summary,
+.operations > summary {
+  font-size: 14px;
+  font-weight: 550;
+}
+.candidate-section,
+.operations {
+  margin-top: 18px;
+}
+.filter + .filter {
+  margin-top: 8px;
+}
+.queue-tools .filter {
+  justify-content: space-between;
+}
+.queue-tools .filter select {
+  max-width: 180px;
+}
+.billing {
+  padding: 16px 18px;
+}
+.billing-values strong {
+  font-size: 19px;
+}
+.ops-health > svg {
+  display: none;
+}
+@media (max-width: 760px) {
+  .activity-select {
+    margin: 15px 18px 0;
+  }
+  .activity-select select {
+    font-size: 16px;
+  }
+  .queue-tools .filter select {
+    max-width: 200px;
+  }
+  .billing-values strong {
+    font-size: 20px;
+  }
+}

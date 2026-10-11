@@ -1,0 +1,96 @@
+name: Daily Bellhaven reconciliation
+
+"on":
+  workflow_dispatch:
+  # INACTIVE: uncomment both lines below to run daily at 07:00 UTC.
+  # schedule:
+  #   - cron: '0 7 * * *'
+
+# This job calls the persistent service; it never checks out or executes PR code.
+permissions: {}
+
+concurrency:
+  group: bellhaven-reconciliation
+  cancel-in-progress: false
+
+jobs:
+  refresh-proposals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Collect evidence and refresh proposals
+        shell: python
+        env:
+          BELLHAVEN_SITE_URL: ${{ vars.BELLHAVEN_SITE_URL }}
+          BELLHAVEN_CRON_SECRET: ${{ secrets.BELLHAVEN_CRON_SECRET }}
+          # Only needed while Sites access is private. Never use the CRM token here.
+          BELLHAVEN_SITES_SERVICE_TOKEN: ${{ secrets.BELLHAVEN_SITES_SERVICE_TOKEN }}
+        run: |
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+          site = os.environ.get("BELLHAVEN_SITE_URL", "").strip().rstrip("/")
+          secret = os.environ.get("BELLHAVEN_CRON_SECRET", "")
+          try:
+              parsed = urllib.parse.urlsplit(site)
+              valid = (parsed.scheme == "https" and parsed.hostname
+                       and parsed.hostname.endswith(".chatgpt.site")
+                       and not parsed.username and not parsed.password
+                       and not parsed.path and not parsed.query
+                       and not parsed.fragment and parsed.port in (None, 443))
+          except ValueError:
+              valid = False
+          if not valid or not secret:
+              fail("Configure an HTTPS Sites origin and the pipeline secret in repository settings.")
+
+          headers = {"Authorization": "Bearer " + secret,
+                     "Content-Type": "application/json", "Accept": "application/json",
+                     "User-Agent": "BellhavenReviewDesk/1.0"}
+          service_token = os.environ.get("BELLHAVEN_SITES_SERVICE_TOKEN", "")
+          if service_token:
+              headers["OAI-Sites-Authorization"] = "Bearer " + service_token
+
+          # Do not forward credentials to a redirect or automatically retry a timeout.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          request = urllib.request.Request(site + "/api/desk/pipeline", data=b"{}",
+                                           headers=headers, method="POST")
+          try:
+              with urllib.request.build_opener(NoRedirect).open(request, timeout=180) as response:
+                  payload = json.loads(response.read(65537))
+          except urllib.error.HTTPError as error:
+              fail(f"Pipeline returned HTTP {error.code}. Inspect Activity / Source refreshes before retrying.")
+          except (OSError, ValueError, urllib.error.URLError):
+              fail("No verified pipeline response. Inspect saved run state before retrying; do not reset the ledger.")
+
+          metrics = (("accounts", "Accounts read"), ("contacts", "Contacts read"),
+                     ("facilities", "Website locations"), ("new_proposals", "New proposals this run"),
+                     ("open_proposals", "Open proposals after refresh"))
+          if (not isinstance(payload, dict) or not payload.get("id")
+              or not isinstance(payload.get("coverage"), dict)
+              or payload["coverage"].get("complete") is not True
+              or any(type(payload.get(key)) is not int or payload[key] < 0 for key, _ in metrics)):
+              fail("Pipeline response did not confirm complete source coverage and valid counts.")
+
+          # Log only aggregate counts; no records, headers, or credentials.
+          result = ", ".join(f"{label}: {payload[key]}" for key, label in metrics)
+          print("Completed proposal refresh. " + result)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as output:
+                  output.write("### Bellhaven proposal refresh\n\n")
+                  output.write("| Metric | Count |\n| --- | ---: |\n")
+                  for key, label in metrics:
+                      output.write(f"| {label} | {payload[key]} |\n")
+                  output.write("\nNew proposals are added by this run. Open proposals include earlier cases still awaiting review or recovery, measured when the refresh completed.\n\n")
+                  output.write(f"[Open the review desk]({site})\n\nCRM changes require separate reviewer approval.\n")
